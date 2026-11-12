@@ -10,7 +10,6 @@ import subprocess
 import sys
 import threading
 import urllib.parse
-import urllib.request
 import uuid
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -25,7 +24,7 @@ from pydantic import BaseModel
 
 from .chunker import Chunk, plan_chunks, speech_timestamps
 from .config import Settings
-from .pipeline import HLS_INPUT_ARGS, Engine, VideoSession, decode
+from .pipeline import HLS_INPUT_ARGS, Engine, HlsPlaylist, VideoSession, decode
 from .translate import Translator
 
 S = Settings()
@@ -63,23 +62,33 @@ def _origin_of(referer: str | None) -> str | None:
     return None
 
 
-def _build_ffmpeg_headers(
+def _build_http_headers(
     target_url: str, referer: str | None, cookie: str | None = None, user_agent: str | None = None
-) -> list[str]:
-    hdrs = []
-    if referer:
-        hdrs.append(f"Referer: {referer}")
-        origin = _origin_of(referer)
-        if origin:
-            hdrs.append(f"Origin: {origin}")
-    # Only send cookies if target_url is on the same domain as the page (sending missav.ws cookies to surrit.com triggers Cloudflare 403)
-    if cookie and _same_domain(target_url, referer):
-        hdrs.append(f"Cookie: {cookie}")
+) -> dict[str, str]:
     ua = (
         user_agent
         or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
     )
-    hdrs.append(f"User-Agent: {ua}")
+    headers: dict[str, str] = {
+        "User-Agent": ua,
+        "Accept": "*/*",
+    }
+    if referer:
+        headers["Referer"] = referer
+        origin = _origin_of(referer)
+        if origin:
+            headers["Origin"] = origin
+    # Only send cookies if target_url is on the same domain as the page (sending missav.ws cookies to surrit.com triggers Cloudflare 403)
+    if cookie and _same_domain(target_url, referer):
+        headers["Cookie"] = cookie
+    return headers
+
+
+def _build_ffmpeg_headers(
+    target_url: str, referer: str | None, cookie: str | None = None, user_agent: str | None = None
+) -> list[str]:
+    headers = _build_http_headers(target_url, referer, cookie, user_agent)
+    hdrs = [f"{k}: {v}" for k, v in headers.items()]
     return ["-headers", "\r\n".join(hdrs) + "\r\n"]
 
 
@@ -88,55 +97,18 @@ def _is_hls_manifest(url: str) -> bool:
     return u.endswith(".m3u8") or ".m3u8" in url.lower() or "mpegurl" in url.lower()
 
 
+def _is_master_hls(url: str) -> bool:
+    u = url.lower().split("?")[0]
+    return u.endswith("playlist.m3u8") or u.endswith("master.m3u8") or u.endswith("index.m3u8")
+
+
 def _is_short_segment(url: str) -> bool:
     u = url.lower().split("?")[0]
-    return u.endswith(".ts") or u.endswith(".m4s")
+    return u.endswith(".ts") or u.endswith(".m4s") or u.endswith(".jpeg") or u.endswith(".jpg")
 
 
-def _probe_hls_manifest_fast(url: str, referer: str | None, user_agent: str | None) -> float | None:
-    """Fast HTTP check for .m3u8 playlists (like surrit.com/missav.ws).
-    Parses #EXTINF segment durations directly in <0.5s instead of waiting 20s for ffprobe to scan 1,500 segments!"""
-    try:
-        headers = {
-            "User-Agent": user_agent
-            or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Accept": "*/*",
-        }
-        if referer:
-            headers["Referer"] = referer
-            origin = _origin_of(referer)
-            if origin:
-                headers["Origin"] = origin
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            text = resp.read(512_000).decode("utf-8", errors="ignore")
-        if "#EXTM3U" not in text:
-            return None
-        # Sum #EXTINF:<seconds>, if this is a media playlist (like 1080p/video.m3u8)
-        total = 0.0
-        for line in text.splitlines():
-            if line.startswith("#EXTINF:"):
-                val = line[8:].split(",")[0].strip()
-                try:
-                    total += float(val)
-                except ValueError:
-                    pass
-        if total > 0:
-            return round(total, 2)
-        # Master playlist (#EXT-X-STREAM-INF) -> valid playlist, duration will come from browser or sub-playlist
-        return 0.0
-    except Exception as e:
-        print(f"[hls-probe] HTTP check failed for {url[:90]}: {e}", flush=True)
-        return None
-
-
-def _probe_duration(url: str, header_args: list[str], referer: str | None = None, user_agent: str | None = None) -> float | None:
-    """Duration of a URL that carries an audio/media stream."""
-    if _is_hls_manifest(url):
-        fast_dur = _probe_hls_manifest_fast(url, referer, user_agent)
-        if fast_dur is not None:
-            return fast_dur
-
+def _probe_duration(url: str, header_args: list[str]) -> float | None:
+    """Duration of a non-HLS URL that carries an audio/media stream."""
     extra = HLS_INPUT_ARGS if _is_hls_manifest(url) else []
     base = ["ffprobe", "-v", "error", *header_args, *extra]
     try:
@@ -169,31 +141,42 @@ def pick_url(
     cookie: str | None,
     user_agent: str | None,
     exact: bool = False,
-) -> tuple[str, float, list[str]]:
+) -> tuple[str, float, list[str], HlsPlaylist | None]:
     """Select the best media URL.
-    Prioritizes specific .m3u8 media playlists (e.g. 1080p/video.m3u8) and master playlists (playlist.m3u8)
-    over individual 4-second .ts segments."""
+    For .m3u8 HLS playlists, builds an HlsPlaylist in Python so segments (even disguised as .jpeg/.png)
+    are downloaded directly in Python and piped to FFmpeg."""
     ordered = sorted(
         urls,
-        key=lambda u: (0 if _is_hls_manifest(u) else (2 if _is_short_segment(u) else 1)),
+        key=lambda u: (
+            0 if _is_master_hls(u) else (1 if _is_hls_manifest(u) else (3 if _is_short_segment(u) else 2))
+        ),
     )
 
     best, best_d, best_hdrs, best_err = None, 0.0, [], 1e9
     for u in ordered:
+        http_hdrs = _build_http_headers(u, referer, cookie, user_agent)
         hdr_args = _build_ffmpeg_headers(u, referer, cookie, user_agent)
-        d = _probe_duration(u, hdr_args, referer=referer, user_agent=user_agent)
+
+        if _is_hls_manifest(u):
+            pl = HlsPlaylist.from_url(u, http_hdrs)
+            if pl is not None and len(pl.segments) > 0:
+                resolved_dur = pl.duration if pl.duration > 0 else (duration if duration > 0 else 3600.0)
+                print(
+                    f"[pick] HLS playlist ready: {len(pl.segments)} segments, "
+                    f"duration={resolved_dur:.1f}s url={pl.media_url[:100]}",
+                    flush=True,
+                )
+                return pl.media_url, resolved_dur, hdr_args, pl
+
+        d = _probe_duration(u, hdr_args)
         print(f"[pick] duration={d} exact={exact} url={u[:110]}", flush=True)
         if d is None:
             continue
-        # Reject 2-12s .ts segments when the actual video in the browser is much longer (>25s)
         if duration > 25.0 and 0 < d < 15.0 and _is_short_segment(u):
-            print(f"[pick] skipping short .ts/.m4s segment ({d:.1f}s vs expected {duration:.1f}s)", flush=True)
+            print(f"[pick] skipping short segment ({d:.1f}s vs expected {duration:.1f}s)", flush=True)
             continue
-        if _is_hls_manifest(u):
-            resolved_dur = d if d > 0 else (duration if duration > 0 else 3600.0)
-            return u, resolved_dur, hdr_args
         if exact and (duration <= 0 or d == 0.0 or abs(d - duration) <= max(5.0, duration * 0.15)):
-            return u, (d if d > 0 else duration), hdr_args
+            return u, (d if d > 0 else duration), hdr_args, None
         err = abs(d - duration) if (duration > 0 and d > 0) else 0.0
         if err < best_err:
             best, best_d, best_hdrs, best_err = u, (d if d > 0 else duration), hdr_args, err
@@ -204,7 +187,7 @@ def pick_url(
         raise RuntimeError(
             "No reachable media stream with audio found (check if site uses DRM or only exposed a .ts segment)"
         )
-    return best, best_d, best_hdrs
+    return best, best_d, best_hdrs, None
 
 
 class Job:
@@ -291,6 +274,7 @@ def run_job(job: Job) -> None:
         )
         a16 = None
         stream_url = None
+        hls_playlist: HlsPlaylist | None = None
         header_args: list[str] = []
 
         if is_youtube:
@@ -329,7 +313,7 @@ def run_job(job: Job) -> None:
             a16 = decode(src_audio, 16000, 1)
             job.duration = len(a16) / 16000
         else:
-            picked_url, probed_dur, header_args = pick_url(
+            picked_url, probed_dur, header_args, hls_playlist = pick_url(
                 job.urls, job.expected, job.referer, job.cookie, job.user_agent, job.exact
             )
             job.url = picked_url
@@ -337,9 +321,14 @@ def run_job(job: Job) -> None:
                 job.state = "cancelled"
                 return
 
-            # For .m3u8 streams or long videos (> 4 minutes), use windowed streaming so subtitles start in ~1-2 seconds!
             effective_dur = probed_dur or job.expected or 3600.0
-            if (_is_hls_manifest(picked_url) or effective_dur > 240.0) and effective_dur > 0:
+            if hls_playlist is not None:
+                print(
+                    f"[job {job.id}] Using Python HLS Segment Streamer for {picked_url[:90]} (duration={effective_dur:.1f}s)",
+                    flush=True,
+                )
+                job.duration = effective_dur
+            elif (_is_hls_manifest(picked_url) or effective_dur > 240.0) and effective_dur > 0:
                 print(
                     f"[job {job.id}] Using real-time windowed stream mode for {picked_url[:90]} (duration={effective_dur:.1f}s)",
                     flush=True,
@@ -396,6 +385,7 @@ def run_job(job: Job) -> None:
             transcript_lang=job.transcript_lang,
             stream_url=stream_url,
             stream_args=header_args,
+            hls_playlist=hls_playlist,
         )
         job.session = session
         job.state = "running"
@@ -423,8 +413,9 @@ def run_job(job: Job) -> None:
                 job.timing[i] = timing
             dur = max(0.1, c.end - c.start)
             print(
-                f"[job {job.id}] chunk {i}/{len(job.chunks)} ({c.start:.1f}s-{c.end:.1f}s) "
-                f"{len(subs)} subs | {timing} RTF={timing.get('total', 0.0) / dur:.2f}",
+                f"[job {job.id}] DONE chunk {i}/{len(job.chunks)} ({c.start:.1f}s-{c.end:.1f}s) -> "
+                f"{len(subs)} Vietnamese sub(s) ready | timing={timing} RTF={timing.get('total', 0.0) / dur:.2f}\n"
+                f"------------------------------------------------------------",
                 flush=True,
             )
 
@@ -549,6 +540,17 @@ def health():
 
 
 def main() -> None:
+    masked_key = (
+        f"{S.api_key[:9]}...{S.api_key[-4:]}"
+        if (S.api_key and S.api_key != "dummy" and len(S.api_key) > 14)
+        else "NOT SET (Check .env!)"
+    )
+    print("============================================================", flush=True)
+    print(f"[Config] Source Language   : {S.source_language} (Whisper model: {S.whisper_model})", flush=True)
+    print(f"[Config] Translation API   : {S.base_url}", flush=True)
+    print(f"[Config] Translation Model : {S.model}", flush=True)
+    print(f"[Config] OpenRouter Key    : {masked_key}", flush=True)
+    print("============================================================", flush=True)
     _engine()  # load Whisper model up front so the first request is fast
     print("[server] Whisper ASR ready (Subtitle-Only mode)", flush=True)
     uvicorn.run(app, host="127.0.0.1", port=8765, log_level="warning")

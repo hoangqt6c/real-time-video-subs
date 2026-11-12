@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 
 from .asr import Seg
 from .config import Settings
@@ -68,7 +69,7 @@ def _json_object(content: str) -> dict:
     raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
     idx = raw.find("{")
     if idx < 0:
-        raise ValueError("No JSON object found in LLM response")
+        raise ValueError(f"No JSON object found in LLM response: {raw[:160]}")
     return json.JSONDecoder().raw_decode(raw[idx:])[0]
 
 
@@ -134,6 +135,9 @@ class Translator:
         """Build the story bible from the SOURCE transcript. lines: [(start_sec, source_text)] in time order."""
         if not lines:
             return
+        if self.s.api_key == "dummy":
+            print("[OpenRouter WARNING] No API key configured in .env! Skipping Story Bible.", flush=True)
+            return
         transcript = _transcript_message(lines, complete, self.s.transcript_max_chars)
         messages = [
             {"role": "system", "content": UNDERSTAND_SYSTEM},
@@ -154,8 +158,11 @@ class Translator:
                 self.bible = bible
                 self._bible_text = _bible_message(bible)
         if bible is not None:
-            print(f"[bible] from {len(lines)} lines (complete={complete}): {len(bible['characters'])} characters, "
-                  f"{len(bible['terminology'])} terms, {len(bible['asr_fixes'])} asr fixes", flush=True)
+            print(
+                f"[bible] Built Story Bible from {len(lines)} lines (complete={complete}): "
+                f"{len(bible['characters'])} characters, {len(bible['terminology'])} terms",
+                flush=True,
+            )
 
     def translate(self, segs: list[Seg], slots: list[float]) -> None:
         if not segs:
@@ -164,6 +171,22 @@ class Translator:
             for g in segs:
                 self.history.append((g.zh, g.vi))
             return
+        if self.s.api_key == "dummy":
+            print(
+                "[Step 3/3 - OpenRouter ERROR] OPENROUTER_API_KEY is missing in .env! "
+                "Please paste your key in .env and restart run_server.bat.",
+                flush=True,
+            )
+            for g in segs:
+                g.vi = g.zh
+            return
+
+        t0 = time.time()
+        print(
+            f"[Step 3/3 - OpenRouter VI] Uploading {len(segs)} Japanese line(s) to {self.s.base_url} "
+            f"(model={self.s.model})...",
+            flush=True,
+        )
         ctx = self.history[-self.s.context_pairs :]
         req = {
             "previous_lines": [{"zh": z, "vi": v} for z, v in ctx],
@@ -179,15 +202,27 @@ class Translator:
             messages.append({"role": "user", "content": transcript_text})
         messages.append({"role": "user", "content": json.dumps(req, ensure_ascii=False)})
         result: dict[int, str] = {}
-        for _ in range(3):
+        for attempt in range(1, 4):
             try:
                 r = self.client.chat.completions.create(model=self.s.model, messages=messages, max_tokens=4000)
-                self._log_usage(r, "translate")
+                self._log_usage(r, "OpenRouter")
                 result = _parse(r.choices[0].message.content)
                 if all(i in result for i in range(len(segs))):
                     break
             except Exception as exc:  # network / malformed JSON -> retry
-                print(f"[translate] retry: {exc}", flush=True)
+                print(f"[Step 3/3 - OpenRouter WARNING] Attempt {attempt}/3 failed: {exc}", flush=True)
+
+        elapsed = time.time() - t0
+        if result:
+            print(
+                f"[Step 3/3 - OpenRouter VI] SUCCESS! Translated {len(result)}/{len(segs)} line(s) in {elapsed:.2f}s:",
+                flush=True,
+            )
+        else:
+            print(
+                f"[Step 3/3 - OpenRouter ERROR] Translation failed after 3 attempts ({elapsed:.2f}s) - falling back to original text.",
+                flush=True,
+            )
         for i, g in enumerate(segs):
             g.vi = _clean(result[i]) if i in result else g.zh
             self.history.append((g.zh, g.vi))
@@ -199,4 +234,4 @@ class Translator:
             return
         details = getattr(u, "prompt_tokens_details", None)
         cached = getattr(details, "cached_tokens", 0) or 0
-        print(f"[{label}] prompt={u.prompt_tokens} cached={cached} completion={u.completion_tokens}", flush=True)
+        print(f"   [{label} tokens] prompt={u.prompt_tokens} cached={cached} completion={u.completion_tokens}", flush=True)

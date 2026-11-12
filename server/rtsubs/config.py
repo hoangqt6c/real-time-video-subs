@@ -14,12 +14,20 @@ def _load_env() -> None:
     for line in env.read_text(encoding="utf-8").splitlines():
         if "=" in line and not line.lstrip().startswith("#"):
             key, value = line.split("=", 1)
-            val = value.strip()
-            if val:
+            val = value.strip().strip("'\"")
+            if val and "paste-your-" not in val:
                 os.environ.setdefault(key.strip(), val)
 
 
 _load_env()
+
+
+def _resolve_api_key() -> str:
+    for env_name in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
+        val = os.environ.get(env_name, "").strip().strip("'\"")
+        if val and "paste-your-" not in val and val != "dummy":
+            return val
+    return "dummy"
 
 
 @dataclass
@@ -35,11 +43,7 @@ class Settings:
     base_url: str = field(
         default_factory=lambda: os.environ.get("TRANSLATION_BASE_URL", "") or "https://openrouter.ai/api/v1"
     )
-    api_key: str = field(
-        default_factory=lambda: os.environ.get("OPENROUTER_API_KEY", "")
-        or os.environ.get("OPENAI_API_KEY", "")
-        or "dummy"
-    )
+    api_key: str = field(default_factory=_resolve_api_key)
     model: str = field(
         default_factory=lambda: os.environ.get("TRANSLATION_MODEL", "") or "google/gemma-3-27b-it"
     )

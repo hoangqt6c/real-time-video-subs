@@ -46,8 +46,10 @@ class Asr:
             lang = None
         prompt = JA_INITIAL_PROMPT if lang == "ja" else None
         dur = len(audio16k) / 16000.0
+        peak = float(np.max(np.abs(audio16k))) if len(audio16k) > 0 else 0.0
         print(
-            f"[Whisper] Transcribing audio chunk {offset:.1f}s -> {offset + dur:.1f}s (lang={lang or 'auto'})...",
+            f"[Step 2/3 - Whisper JA] Transcribing {offset:.1f}s -> {offset + dur:.1f}s "
+            f"(lang={lang or 'auto'}, audio_dur={dur:.1f}s, peak_vol={peak:.2f})...",
             flush=True,
         )
         segs, _ = self.model.transcribe(
@@ -73,5 +75,14 @@ class Asr:
                 out.append(seg)
                 print(f"   [JA {seg.start:6.1f}s -> {seg.end:6.1f}s] {seg.zh}", flush=True)
         if not out:
-            print(f"   [Whisper] (No speech detected in {offset:.1f}s -> {offset + dur:.1f}s)", flush=True)
+            print(
+                f"   [Step 2/3 - Whisper JA] No speech detected in {offset:.1f}s -> {offset + dur:.1f}s "
+                f"(silence/music only -> skipping OpenRouter translation)",
+                flush=True,
+            )
+        else:
+            print(
+                f"   [Step 2/3 - Whisper JA] Found {len(out)} Japanese speech line(s) in {offset:.1f}s -> {offset + dur:.1f}s",
+                flush=True,
+            )
         return out
