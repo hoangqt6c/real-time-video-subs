@@ -21,8 +21,14 @@ def speech_timestamps(audio16k: np.ndarray) -> list[tuple[float, float]]:
 
     model = load_silero_vad()
     ts = get_speech_timestamps(
-        torch.from_numpy(audio16k), model, sampling_rate=16000,
-        min_silence_duration_ms=250, speech_pad_ms=100, return_seconds=True,
+        torch.from_numpy(audio16k),
+        model,
+        sampling_rate=16000,
+        threshold=0.32,
+        min_speech_duration_ms=120,
+        min_silence_duration_ms=250,
+        speech_pad_ms=200,
+        return_seconds=True,
     )
     return [(t["start"], t["end"]) for t in ts]
 

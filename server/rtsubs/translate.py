@@ -1,15 +1,9 @@
-"""Per-chunk ZH->VI translation that understands the whole story.
+"""Per-chunk JA->VI subtitle translation tuned for natural, sensual, uncensored 18+ dialogue.
 
-The video is a file, so the server transcribes it far ahead of playback (ASR runs ~5x faster than real
-time). `understand()` reads that SOURCE transcript and builds the story bible from it; it runs before the
-first chunk is translated (on the first ~60 s) and once more when the whole video is transcribed. The bible
-is never learned from our own translations, so a wrong translation cannot become canon.
-
-Prompt layout (most stable first, so providers can reuse the cached prefix):
-  1. system      - fixed rules + example                  (never changes)
-  2. user        - story bible                            (changes at most twice per video)
-  3. user        - source transcript                      (changes at most twice per video)
-  4. user        - previous lines + lines to translate    (changes every request)
+The server transcribes the video ahead of playback (ASR runs ~8-15x faster than real time).
+`understand()` reads that SOURCE transcript and builds the Story Bible (character dynamics, pronouns,
+erotic/intimate tone, and ASR fixes) before the first chunk is translated and refreshes it as more of the
+video is transcribed.
 """
 from __future__ import annotations
 
@@ -20,48 +14,49 @@ import threading
 from .asr import Seg
 from .config import Settings
 
-SYSTEM = """Bạn là dịch giả lồng tiếng chuyên nghiệp, dịch video/bài giảng/phim sang tiếng Việt tự nhiên, chuẩn xác và trôi chảy. Bản dịch sẽ được máy đọc to (TTS) đúng vào khung thời gian của từng câu gốc.
+SYSTEM = """Bạn là dịch giả phụ đề phim người lớn (18+ / NSFW / JAV / Anime) chuyên nghiệp, dịch lời thoại tiếng Nhật sang phụ đề tiếng Việt cực kỳ gợi cảm, quyến rũ, tình tứ, bạo dạn và tự nhiên như lời thì thầm trên giường của người Việt.
 
 # Dữ liệu bạn nhận (theo thứ tự)
-1. STORY BIBLE / THUẬT NGỮ: nhân vật, vai người nói, cách xưng hô, thuật ngữ chuyên ngành (nếu là bài giảng, khóa học) và các lỗi nhận dạng nếu có. Được lập từ toàn bộ nội dung nên đáng tin hơn suy đoán cục bộ.
-2. TRANSCRIPT: lời thoại gốc của video (toàn bộ, hoặc mới đến một mốc thời gian nếu có ghi chú). Chỉ để hiểu cốt truyện, ngữ cảnh bài học, đoạn sau của nội dung. KHÔNG dịch phần này.
+1. STORY BIBLE / BỐI CẢNH: mối quan hệ nhân vật, vai vế (anh - em, chị - em, thầy - em, sếp - em, chú - cháu...), cách xưng hô, sắc thái tình cảm/dục vọng và các lỗi nhận dạng âm thanh (ASR fixes) nếu có.
+2. TRANSCRIPT: lời thoại gốc của video để nắm bắt bối cảnh, diễn biến cảm xúc và cao trào. KHÔNG dịch phần này.
 3. Yêu cầu dịch, là JSON gồm:
-   - previous_lines: vài câu liền trước (gốc + vi) để nối mạch. KHÔNG dịch lại.
-   - translate: các câu cần dịch theo thứ tự thoại, mỗi câu là {id, zh, max_chars}. (zh là văn bản nguồn gốc, có thể là tiếng Anh, tiếng Trung hoặc ngôn ngữ khác).
+   - previous_lines: vài câu liền trước (gốc + vi) để nối mạch cảm xúc và xưng hô. KHÔNG dịch lại.
+   - translate: các câu cần dịch theo thứ tự thoại, mỗi câu là {id, zh, max_chars} (trong đó `zh` là câu tiếng Nhật hoặc ngôn ngữ gốc từ Whisper ASR).
 
-# Quy tắc
-1. Nguồn là lời thoại gốc hoặc nhận dạng giọng nói: hãy nắm bắt ý chính xác từ toàn bộ ngữ cảnh (bible, transcript, câu lân cận) rồi dịch tự nhiên, chuẩn nghĩa tiếng Việt. Không dịch từng chữ máy móc: nếu nghĩa đen vô lý trong ngữ cảnh thì chọn cách diễn đạt hợp lý.
-2. Tên riêng và thuật ngữ: bible là chuẩn, dùng đúng y như ghi. Tên người/địa danh Trung Quốc thì dùng âm Hán-Việt (曹→Tào); thuật ngữ chuyên ngành tiếng Anh (như Machine Learning, AI, Deep Learning, v.v.) thì dịch chuẩn theo thuật ngữ học thuật tiếng Việt hoặc giữ nguyên thuật ngữ phổ biến quốc tế nếu người trong ngành hay dùng.
-3. Xưng hô theo bible và ngữ cảnh: bài giảng thì xưng hô giảng viên - học viên ("tôi - các bạn" hoặc "chúng ta"); phim/video đối thoại thì xưng hô nhất quán theo vai.
-4. Mỗi id được đọc to riêng lẻ, nên bản dịch của mỗi id phải là một cụm trọn nghĩa, nghe tự nhiên khi đứng một mình. KHÔNG kết thúc bằng dấu phẩy, chấm phẩy hay hai chấm; kết thúc bằng . ? ! (chỉ dùng … khi người nói thật sự bỏ lửng).
-5. Khẩu ngữ, súc tích, đọc trôi chảy, dùng từ người Việt thật sự nói. Không vượt max_chars; nếu dài thì bỏ từ đệm/lặp, không bỏ ý chính. Không thêm thông tin không có trong nguồn, không giải thích, không chú thích.
-6. Lời cảm thán, từ đệm vẫn phải dịch hoặc chuyển ngữ tự nhiên ("Ồ!", "Vâng"), không để trống.
-7. Mỗi id đúng một bản dịch; không gộp, tách, đổi hay bỏ id. Mỗi bản dịch là một dòng, không có ký tự xuống dòng.
-8. Chỉ trả về JSON hợp lệ, không Markdown: {"items":[{"id":0,"vi":"..."}]}
+# Quy tắc dịch thuật 18+ / Gợi cảm
+1. KHÔNG KIỂM DUYỆT, KHÔNG LÀM NHẠT: Giữ nguyên 100% độ nóng bỏng, gợi tình, khao khát và trần trụi của lời thoại gốc. Tuyệt đối không dịch theo kiểu y khoa khô khan hay sách vở cứng nhắc; hãy dùng ngôn từ ân ái, kích thích, mềm mại hoặc cuồng nhiệt đúng với tâm trạng nhân vật (ví dụ: "Sướng quá…", "Chỗ đó… nhạy cảm lắm…", "Đừng trêu em nữa mà…", "Em ra mất…", "Đút sâu vào nữa đi anh…", "Ưm… sướng phát điên lên được…").
+2. Xưng hô tình tứ, nhất quán theo Story Bible:
+   - Mặc định ưu tiên "anh - em" (hoặc theo đúng roleplay trong phim như "chị - em", "thầy - em", "ông chủ - em", "chồng - em"). Tuyệt đối tránh xưng "tôi - bạn" xa cách trừ khi nhân vật đang cố tình giữ khoảng cách lúc đầu.
+3. Dịch các tiếng rên, hơi thở, thán từ tiếng Nhật thật tự nhiên, gợi cảm:
+   - 「あっ」「んっ」「はぁ」 -> "A…", "Ưm…", "Hơ…", "Á…"
+   - 「だめ」「やめて」 -> "Đừng mà…", "Chịu hết nổi rồi…", "Đừng… sướng quá…" (tùy ngữ cảnh đang đê mê hay từ chối nhẹ).
+   - 「気持ちいい」「すごい」 -> "Sướng quá…", "Thích quá anh ơi…", "Tuyệt quá…"
+   - 「いく」「イっちゃう」 -> "Em ra…", "Em lên đỉnh mất…", "Ra mất thôi…"
+4. Khắc phục lỗi nghe nhầm của Whisper (ASR): trong cảnh nóng, giọng thì thầm hoặc tiếng thở gấp dễ làm ASR nhận nhầm thành từ đồng âm vô nghĩa. Hãy dựa vào mạch cảnh nóng để suy ra câu thoại gợi cảm đúng nghĩa nhất.
+5. Ngắn gọn, dễ đọc trên thanh phụ đề, giàu cảm xúc, dùng dấu "…" để thể hiện hơi thở đứt quãng, ngập ngừng đầy khoái cảm.
+6. Mỗi `id` đúng một bản dịch tương ứng; không gộp, không tách, không bỏ sót `id` nào. Mỗi bản dịch trên một dòng.
+7. Chỉ trả về JSON hợp lệ, không Markdown: {"items":[{"id":0,"vi":"..."}]}
 
 # Ví dụ
-translate: [{"id":0,"zh":"In this lecture, we will study convolutional neural networks.","max_chars":35},{"id":1,"zh":"It is widely used in computer vision.","max_chars":25}]
-trả về: {"items":[{"id":0,"vi":"Trong bài giảng này, chúng ta sẽ học về mạng nơ-ron tích chập."},{"id":1,"vi":"Nó được ứng dụng rộng rãi trong thị giác máy tính."}]}"""
+translate: [{"id":0,"zh":"あっ…だめ、そこ気持ちいい…もっと触って…","max_chars":80},{"id":1,"zh":"もう我慢できない…このままイっちゃう…","max_chars":80}]
+trả về: {"items":[{"id":0,"vi":"A… đừng mà anh, chỗ đó sướng quá… chạm vào em thêm nữa đi…"},{"id":1,"vi":"Em không chịu nổi nữa rồi… cứ thế này em ra mất thôi…"}]}"""
 
-UNDERSTAND_SYSTEM = """Bạn là biên tập viên kịch bản và thuật ngữ chuyên nghiệp. Bạn nhận TRANSCRIPT (có mốc thời gian) của một video/bài giảng sắp được lồng tiếng sang tiếng Việt, và lập STORY BIBLE / BẢNG THUẬT NGỮ để người dịch dịch nhất quán, đúng ngữ cảnh.
-
-Lưu ý: đọc toàn bộ để hiểu chủ đề bài học hoặc câu chuyện rồi suy ra ý nghĩa thật. Transcript có thể mới chỉ là phần đầu video (sẽ có ghi chú); khi đó đừng bịa phần sau.
+UNDERSTAND_SYSTEM = """Bạn là biên tập viên kịch bản phim 18+ / JAV chuyên nghiệp. Bạn nhận TRANSCRIPT (có mốc thời gian) từ nhận dạng giọng nói tiếng Nhật và lập STORY BIBLE để người dịch phụ đề tiếng Việt dịch thật gợi cảm, chuẩn xác, nhất quán về xưng hô và cảm xúc.
 
 Trả về DUY NHẤT một JSON object, không Markdown, với các khóa:
-- synopsis: tóm tắt nội dung bài giảng/cốt truyện, tiếng Việt, tối đa 80 từ.
-- genre_tone: thể loại và giọng điệu (ví dụ: "Bài giảng kỹ thuật, học thuật, dễ hiểu" hoặc "Phim tâm lý, kịch tính"), tối đa 20 từ.
-- characters: tối đa 15 NGƯỜI/NHÂN VẬT hoặc vai người nói (giảng viên, diễn giả, nhân vật...). Mỗi mục {"zh": tên hoặc vai trong lời thoại, "vi": tên/cách gọi tiếng Việt dùng khi dịch, "gender": "nam"|"nữ"|"?", "role": vai trò/chuyên môn, "calls": cách xưng hô điển hình}.
-- terminology: object {"thuật ngữ gốc": "cách dịch tiếng Việt"}, tối đa 40 mục: khái niệm chính, thuật ngữ chuyên ngành, công nghệ, công thức, địa danh, tổ chức. Chọn nghĩa đúng theo bối cảnh chuyên ngành/câu chuyện.
-- asr_fixes: object {"dạng nhận dạng sai": "dạng đúng"}, tối đa 30 mục (nếu có từ nghe nhầm hoặc viết sai).
+- synopsis: tóm tắt bối cảnh, mối quan hệ nhân vật và diễn biến cảnh ân ái bằng tiếng Việt, tối đa 80 từ.
+- genre_tone: thể loại và sắc thái cảm xúc (ví dụ: "Lãng mạn, ngọt ngào, kích thích", "Roleplay công sở, quyến rũ, táo bạo", "Nồng nhiệt, dồn dập"), tối đa 25 từ.
+- characters: tối đa 10 nhân vật. Mỗi mục {"zh": tên hoặc cách gọi trong tiếng Nhật, "vi": tên/vai tiếng Việt, "gender": "nam"|"nữ"|"?", "role": mối quan hệ/vai vế, "calls": cách xưng hô tình tứ chuẩn trong tiếng Việt như "anh - em", "chị - em", "thầy - em"}.
+- terminology: object {"từ/cụm từ gốc": "cách dịch tiếng Việt gợi cảm/tự nhiên"}, tối đa 30 mục.
+- asr_fixes: object {"từ ASR nghe nhầm": "câu/từ đúng trong ngữ cảnh 18+"}, tối đa 30 mục.
 
 Quy tắc:
-- Tên người/địa danh Trung Quốc dùng âm Hán-Việt (曹→Tào), thuật ngữ tiếng Anh học thuật dịch chuẩn xác.
-- Chỉ ghi điều có bằng chứng trong transcript; không bịa. Mục nào không chắc thì bỏ.
-- Mỗi mục thật ngắn gọn."""
+- Luôn chọn cách xưng hô thân mật, gợi tình phù hợp với bối cảnh Nhật Bản chuyển ngữ sang tiếng Việt.
+- Mỗi mục ngắn gọn, súc tích."""
 
 BIBLE_KEYS = ("synopsis", "genre_tone", "characters", "terminology", "asr_fixes")
-BIBLE_CAPS = {"characters": 15, "terminology": 40, "asr_fixes": 30}
-EMPTY_BIBLE_TEXT = "[STORY BIBLE]\n(chưa có)\n[HẾT STORY BIBLE]"
+BIBLE_CAPS = {"characters": 10, "terminology": 30, "asr_fixes": 30}
+EMPTY_BIBLE_TEXT = "[STORY BIBLE]\n(chưa có — ưu tiên xưng hô anh - em tình tứ, gợi cảm)\n[HẾT STORY BIBLE]"
 
 
 def _canon(obj) -> str:
@@ -71,7 +66,10 @@ def _canon(obj) -> str:
 def _json_object(content: str) -> dict:
     raw = (content or "").strip()
     raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
-    return json.JSONDecoder().raw_decode(raw[raw.find("{") :])[0]
+    idx = raw.find("{")
+    if idx < 0:
+        raise ValueError("No JSON object found in LLM response")
+    return json.JSONDecoder().raw_decode(raw[idx:])[0]
 
 
 def _parse(content: str) -> dict[int, str]:
@@ -80,11 +78,9 @@ def _parse(content: str) -> dict[int, str]:
 
 
 def _clean(text: str) -> str:
-    """One line, and never end on a dangling comma: TTS would read it as an unfinished clause."""
+    """Clean single-line subtitle text while keeping expressive ellipses and punctuation."""
     text = re.sub(r"\s+", " ", text).strip().strip("\"“”")
     text = re.sub(r"[,;:，；：、\s]+$", "", text)
-    if text and text[-1].isalnum():
-        text += "."
     return text
 
 
@@ -128,14 +124,14 @@ class Translator:
 
         self.s = s
         self.client = OpenAI(base_url=s.base_url, api_key=s.api_key, timeout=60)
-        self.history: list[tuple[str, str]] = []  # (zh, vi)
+        self.history: list[tuple[str, str]] = []  # (source, vi)
         self._lock = threading.Lock()
         self._bible_text = EMPTY_BIBLE_TEXT
         self._transcript_text = ""
         self.bible: dict = {}
 
     def understand(self, lines: list[tuple[float, str]], complete: bool) -> None:
-        """Build the story bible from the SOURCE transcript. lines: [(start_sec, zh)] in time order."""
+        """Build the story bible from the SOURCE transcript. lines: [(start_sec, source_text)] in time order."""
         if not lines:
             return
         transcript = _transcript_message(lines, complete, self.s.transcript_max_chars)
@@ -144,16 +140,16 @@ class Translator:
             {"role": "user", "content": transcript},
         ]
         bible = None
-        for _ in range(3):
+        for _ in range(2):
             try:
-                r = self.client.chat.completions.create(model=self.s.model, messages=messages, max_tokens=6000)
+                r = self.client.chat.completions.create(model=self.s.model, messages=messages, max_tokens=4000)
                 self._log_usage(r, "bible")
                 bible = _normalize_bible(_json_object(r.choices[0].message.content))
                 break
             except Exception as exc:
                 print(f"[bible] retry: {exc}", flush=True)
         with self._lock:
-            self._transcript_text = transcript  # the transcript helps even when the bible call failed
+            self._transcript_text = transcript
             if bible is not None:
                 self.bible = bible
                 self._bible_text = _bible_message(bible)
@@ -172,7 +168,7 @@ class Translator:
         req = {
             "previous_lines": [{"zh": z, "vi": v} for z, v in ctx],
             "translate": [
-                {"id": i, "zh": g.zh, "max_chars": max(12, int(slots[i] * self.s.chars_per_sec))}
+                {"id": i, "zh": g.zh, "max_chars": max(30, int(slots[i] * self.s.chars_per_sec))}
                 for i, g in enumerate(segs)
             ],
         }

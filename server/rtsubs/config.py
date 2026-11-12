@@ -23,28 +23,17 @@ _load_env()
 @dataclass
 class Settings:
     workspace: Path = ROOT / "workspace"
-    vieneu_python: str = os.environ.get(
-        "VIENEU_PYTHON", str(Path.home() / "miniconda3/envs/vieneu-tts/python.exe")
-    )
-    vieneu_model_dir: Path = ROOT / "models/vieneu/v3-turbo"
-    vieneu_codec_dir: Path = ROOT / "models/vieneu/codec"
-    vieneu_voice: str = "Trúc Ly"
-    whisper_model: str = "large-v3-turbo"
-    whisper_compute: str = "int8_float16"
-    demucs_model: str = "htdemucs"
-    demucs_margin_sec: float = 1.0
-    chunk_min_sec: float = 8.0
-    chunk_target_sec: float = 12.0
-    chunk_max_sec: float = 16.0
-    mix_sr: int = 44100
-    chars_per_sec: float = 18.0  # Vietnamese TTS budget for translation brevity
-    duck_gain: float = 0.35  # BGM gain while a Vietnamese line is speaking
-    bgm_gain: float = 1.0
-    tts_gain: float = 1.4
+    whisper_model: str = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
+    whisper_compute: str = os.environ.get("WHISPER_COMPUTE", "int8_float16")
+    source_language: str = os.environ.get("SOURCE_LANGUAGE", "ja")
+    chunk_min_sec: float = 6.0
+    chunk_target_sec: float = 10.0
+    chunk_max_sec: float = 14.0
+    chars_per_sec: float = 28.0  # Comfortable subtitle reading budget (no TTS speed constraints)
     base_url: str = field(default_factory=lambda: os.environ.get("TRANSLATION_BASE_URL", ""))
     api_key: str = field(default_factory=lambda: os.environ.get("OPENAI_API_KEY", "") or "dummy")
     model: str = field(default_factory=lambda: os.environ.get("TRANSLATION_MODEL", ""))
-    context_pairs: int = 10
-    story_lookahead_sec: float = 90.0  # background ASR stays at most this far ahead of the chunk being processed
+    context_pairs: int = 12
+    story_lookahead_sec: float = 120.0  # background ASR stays up to 2 minutes ahead of playback
     bible_every: int = 3  # rebuild the story bible after this many newly transcribed chunks
     transcript_max_chars: int = 20000  # cap on the source transcript placed in the prompt

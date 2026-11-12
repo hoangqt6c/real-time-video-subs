@@ -1,11 +1,10 @@
-"""Shared chunk processing + the resident engine used by the HTTP server and the file runner."""
+"""Subtitle-only chunk processing + resident Whisper ASR engine."""
 from __future__ import annotations
 
 import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -18,43 +17,108 @@ import numpy as np
 from .asr import Asr, Seg
 from .chunker import Chunk
 from .config import Settings
-from .mixer import mix_chunk
-from .separate import Separator
 from .translate import Translator
-from .tts import Tts, load_fitted
 
 
-def decode(path: str | Path, sr: int, ch: int, input_args: list[str] | None = None) -> np.ndarray:
+def decode(path: str | Path, sr: int = 16000, ch: int = 1, input_args: list[str] | None = None) -> np.ndarray:
+    """Decode audio from a file, direct URL, or .m3u8 playlist into float32 mono 16kHz PCM."""
     raw = subprocess.run(
-        ["ffmpeg", "-v", "error", *(input_args or []), "-i", str(path), "-vn", "-ac", str(ch), "-ar", str(sr),
-         "-f", "f32le", "-"],
-        capture_output=True, check=True,
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "5",
+            *(input_args or []),
+            "-i",
+            str(path),
+            "-vn",
+            "-ac",
+            str(ch),
+            "-ar",
+            str(sr),
+            "-f",
+            "f32le",
+            "-",
+        ],
+        capture_output=True,
+        check=True,
     ).stdout
     a = np.frombuffer(raw, dtype=np.float32)
     return a.reshape(-1, ch) if ch > 1 else a.copy()
 
 
+def decode_window(
+    path: str | Path, start: float, duration: float, sr: int = 16000, input_args: list[str] | None = None
+) -> np.ndarray:
+    """Decode a specific [start, start+duration] time slice from a URL / .m3u8 playlist quickly via ffmpeg -ss."""
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_delay_max",
+        "5",
+        *(input_args or []),
+    ]
+    if start > 0:
+        cmd += ["-ss", f"{start:.2f}"]
+    cmd += [
+        "-i",
+        str(path),
+    ]
+    if duration > 0:
+        cmd += ["-t", f"{duration:.2f}"]
+    cmd += [
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(sr),
+        "-f",
+        "f32le",
+        "-",
+    ]
+    raw = subprocess.run(cmd, capture_output=True, check=True).stdout
+    return np.frombuffer(raw, dtype=np.float32).copy()
+
+
 class Engine:
-    """Models loaded once; GPU/CPU work is serialised by the caller (one chunk at a time)."""
+    """Whisper ASR model loaded once in GPU/CPU memory."""
 
     def __init__(self, s: Settings):
         self.s = s
         self.asr = Asr(s)
-        self.asr_lock = threading.Lock()  # Whisper is used by the chunk loop and the look-ahead thread
-        self.sep = Separator(s)
-        self.tts = Tts(s)
-        self.pool = ThreadPoolExecutor(max_workers=1)  # Demucs overlaps with ASR/translate/TTS
+        self.asr_lock = threading.Lock()  # Whisper is shared between active chunk and look-ahead thread
 
     def close(self) -> None:
-        self.tts.close()
+        pass
 
 
 class VideoSession:
-    """One video: transcribes it ahead of playback so translation can see the whole story."""
+    """One video session: transcribes chunks ahead of playback and translates into Vietnamese subtitles."""
 
-    def __init__(self, eng: Engine, tr: Translator, a16: np.ndarray, a44: np.ndarray, chunks: list[Chunk],
-                 transcript: list[dict] | None = None, transcript_lang: str | None = None):
-        self.eng, self.tr, self.a16, self.a44, self.chunks = eng, tr, a16, a44, chunks
+    def __init__(
+        self,
+        eng: Engine,
+        tr: Translator,
+        a16: np.ndarray | None,
+        chunks: list[Chunk],
+        transcript: list[dict] | None = None,
+        transcript_lang: str | None = None,
+        stream_url: str | None = None,
+        stream_args: list[str] | None = None,
+    ):
+        self.eng, self.tr, self.a16, self.chunks = eng, tr, a16, chunks
+        self.stream_url = stream_url
+        self.stream_args = stream_args or []
         self.transcript = transcript
         self.transcript_lang = (transcript_lang or "").lower()
         self._segs: dict[int, list[Seg]] = {}
@@ -98,45 +162,66 @@ class VideoSession:
                 self._segs[target_chunk.index].append(seg)
 
         total_segs = sum(len(v) for v in self._segs.values())
-        print(f"[transcript] Pre-populated {total_segs} segments across {len(self.chunks)} chunks (is_vietnamese={is_vi})", flush=True)
+        print(
+            f"[transcript] Pre-populated {total_segs} segments across {len(self.chunks)} chunks (is_vietnamese={is_vi})",
+            flush=True,
+        )
+
+    def _chunk_audio(self, c: Chunk) -> np.ndarray:
+        if self.a16 is not None:
+            s_idx = int(c.start * 16000)
+            e_idx = int(c.end * 16000)
+            if s_idx < len(self.a16):
+                return self.a16[s_idx:e_idx]
+        if self.stream_url:
+            return decode_window(self.stream_url, c.start, c.end - c.start, 16000, self.stream_args)
+        return np.zeros(0, dtype=np.float32)
 
     def segs_for(self, i: int) -> list[Seg]:
         with self.eng.asr_lock:
             if i not in self._segs:
                 c = self.chunks[i]
                 t = time.time()
-                self._segs[i] = self.eng.asr.transcribe(
-                    self.a16[int(c.start * 16000) : int(c.end * 16000)], c.start)
+                pcm = self._chunk_audio(c)
+                if len(pcm) > 800:
+                    self._segs[i] = self.eng.asr.transcribe(pcm, c.start)
+                else:
+                    self._segs[i] = []
                 self._asr_time[i] = time.time() - t
             return self._segs[i]
 
     def _lines(self) -> list[tuple[float, str]]:
         return [(g.start, g.zh) for i in sorted(self._segs) for g in self._segs[i]]
 
-    def warm_up(self) -> None:
-        """Build first story bible / terminology, then read ahead in the background."""
-        if self.cancel.is_set():
+    def warm_up(self, start_index: int = 0) -> None:
+        """Transcribe initial chunk at playhead, build initial context, then read ahead in background."""
+        if self.cancel.is_set() or not self.chunks:
             return
         if self.transcript:
-            is_vi = self.transcript_lang.startswith("vi") or any(bool(g.vi) for segs in self._segs.values() for g in segs)
+            is_vi = self.transcript_lang.startswith("vi") or any(
+                bool(g.vi) for segs in self._segs.values() for g in segs
+            )
             if not is_vi:
                 self.tr.understand(self._lines(), complete=True)
             return
 
-        self.segs_for(self.chunks[0].index)
+        first_idx = max(0, min(start_index, len(self.chunks) - 1))
+        self.play_time = self.chunks[first_idx].start
+        self.segs_for(first_idx)
         if self.cancel.is_set():
             return
-        self.tr.understand(self._lines(), complete=len(self.chunks) == 1)
         if len(self.chunks) > 1 and not self.cancel.is_set():
-            self._ahead = threading.Thread(target=self._read_ahead, daemon=True)
+            self._ahead = threading.Thread(target=self._read_ahead, args=(first_idx,), daemon=True)
             self._ahead.start()
 
-    def _read_ahead(self) -> None:
+    def _read_ahead(self, start_idx: int = 0) -> None:
         s = self.eng.s
-        last_bible = 1
-        for c in self.chunks:
+        last_bible = 0
+        order = list(range(start_idx, len(self.chunks))) + list(range(0, start_idx))
+        for idx in order:
+            c = self.chunks[idx]
             while not self.cancel.is_set() and c.start > self.play_time + s.story_lookahead_sec:
-                if self.cancel.wait(0.5):
+                if self.cancel.wait(0.3):
                     return
             if self.cancel.is_set():
                 return
@@ -144,66 +229,49 @@ class VideoSession:
             if self.cancel.is_set():
                 return
             done = len(self._segs)
-            if done - last_bible >= s.bible_every or done == len(self.chunks):
+            if (done == 2 and last_bible == 0) or (done - last_bible >= s.bible_every) or (done == len(self.chunks)):
                 last_bible = done
                 self.tr.understand(self._lines(), complete=done == len(self.chunks))
 
-    def process(self, i: int, work: Path, cancel_event: threading.Event | None = None) -> tuple[np.ndarray, list[dict], dict]:
+    def process(self, i: int, cancel_event: threading.Event | None = None) -> tuple[list[dict], dict]:
         self.play_time = self.chunks[i].start
-        return process_chunk(self.eng, self.tr, self.a44, self.chunks[i], work,
-                             self.segs_for(i), self._asr_time.get(i, 0.0), cancel_event=cancel_event)
+        return process_chunk(
+            self.tr,
+            self.chunks[i],
+            self.segs_for(i),
+            self._asr_time.get(i, 0.0),
+            cancel_event=cancel_event,
+        )
 
 
 def process_chunk(
-    eng: Engine, tr: Translator, a44: np.ndarray, c: Chunk, work: Path, segs: list[Seg], t_asr: float = 0.0,
+    tr: Translator,
+    c: Chunk,
+    segs: list[Seg],
+    t_asr: float = 0.0,
     cancel_event: threading.Event | None = None,
-) -> tuple[np.ndarray, list[dict], dict]:
-    """Returns (mixed stereo audio for the chunk, subtitle dicts, timing dict). segs come from ASR."""
-    s = eng.s
+) -> tuple[list[dict], dict]:
+    """Returns (subtitle dicts for the chunk, timing dict). No TTS or audio mixing."""
     t_start = time.time()
-    bgm_future = eng.pool.submit(eng.sep.bgm, a44, c.start, c.end)
-
-    slots = [max(0.6, min(g.end, c.end) - g.start) for g in segs]
-    t = time.time()
     if cancel_event and cancel_event.is_set():
-        bgm_future.cancel()
-        return np.zeros((int((c.end - c.start) * s.mix_sr), 2), dtype=np.float32), [], {}
+        return [], {}
 
-    # If all segments already have Vietnamese text (e.g. Vietnamese transcript), skip translation!
-    if all(bool(g.vi) for g in segs):
+    slots = [max(1.0, min(g.end, c.end) - g.start) for g in segs]
+    t = time.time()
+    if not segs or all(bool(g.vi) for g in segs):
         t_tr = 0.0
     else:
         tr.translate(segs, slots)
         t_tr = time.time() - t
 
-    t = time.time()
-    clips, subs, tempos = [], [], []
-    for i, g in enumerate(segs):
-        if cancel_event and cancel_event.is_set():
-            bgm_future.cancel()
-            break
-        subs.append({"start": round(g.start, 2), "end": round(min(g.end, c.end), 2), "zh": g.zh, "vi": g.vi})
-        wav = work / f"c{c.index:03d}_{i:02d}.wav"
-        try:
-            eng.tts.synth(g.vi, wav)
-            audio, tempo = load_fitted(wav, slots[i], s)
-        except Exception as exc:  # one bad line must not kill the chunk
-            print(f"[tts] skipped {g.vi!r}: {exc}", flush=True)
-            continue
-        end = min(g.end, c.end) - c.start
-        off = max(g.start - c.start, end - len(audio) / s.mix_sr)  # right-align to the source end
-        clips.append((off, audio))
-        tempos.append(tempo)
-        wav.unlink(missing_ok=True)
-    t_tts = time.time() - t
-
-    if cancel_event and cancel_event.is_set():
-        bgm_future.cancel()
-        return np.zeros((int((c.end - c.start) * s.mix_sr), 2), dtype=np.float32), [], {}
-
-    mixed = mix_chunk(bgm_future.result(), clips, s)
+    subs = [
+        {"start": round(g.start, 2), "end": round(min(g.end, c.end), 2), "zh": g.zh, "vi": g.vi}
+        for g in segs
+        if g.vi.strip()
+    ]
     timing = {
-        "asr": round(t_asr, 2), "translate": round(t_tr, 2), "tts": round(t_tts, 2),
-        "total": round(time.time() - t_start + t_asr, 2), "max_atempo": round(max(tempos, default=1.0), 2),
+        "asr": round(t_asr, 2),
+        "translate": round(t_tr, 2),
+        "total": round(time.time() - t_start + t_asr, 2),
     }
-    return mixed, subs, timing
+    return subs, timing

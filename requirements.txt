@@ -1,5 +1,5 @@
 # =====================================================================
-# Main Server & Pipeline Dependencies (Python >= 3.10)
+# Real-Time Japanese-to-Vietnamese Subtitle Server Dependencies (Python >= 3.10)
 # =====================================================================
 
 # Web API & Server
@@ -10,14 +10,12 @@ python-dotenv>=1.0.0
 
 # Audio & Signal Processing
 numpy>=1.24.0
-soundfile>=0.12.0
 
-# Deep Learning (PyTorch with CUDA recommended for Demucs/Whisper)
+# Deep Learning (PyTorch with CUDA recommended for Faster-Whisper & Silero VAD)
 torch>=2.2.0
 torchaudio>=2.2.0
 
-# Audio Separation & VAD
-demucs>=4.0.0
+# Voice Activity Detection (VAD)
 silero-vad>=5.1.0
 
 # Speech Recognition (ASR)

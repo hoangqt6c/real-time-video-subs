@@ -1,0 +1,88 @@
+name: Build & Release Windows 10 + Chrome Extension Packages
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validate Python Server & Browser Extension Syntax
+        run: |
+          python3 -m py_compile server/rtsubs/*.py
+          node -c extension/content.js
+          node -c extension/page_hook.js
+
+      - name: Build Ready-to-Run ZIP Packages
+        run: |
+          mkdir -p dist/rtsubs-windows10-ready
+
+          # 1. Standalone Chrome/Edge Extension ZIP
+          cd extension
+          zip -r ../dist/rtsubs-extension.zip manifest.json content.js page_hook.js test/
+          cd ..
+
+          # 2. Full Windows 10 Ready-to-Run Package (No manual building needed)
+          cp -r extension dist/rtsubs-windows10-ready/
+          cp -r server dist/rtsubs-windows10-ready/
+          find dist/rtsubs-windows10-ready/server -name "__pycache__" -type d -exec rm -rf {} +
+          cp run_server.bat requirements.txt .env.example README.md LICENSE dist/rtsubs-windows10-ready/
+
+          cd dist
+          zip -r rtsubs-windows10-ready.zip rtsubs-windows10-ready/
+          cd ..
+
+      - name: Upload Artifacts to GitHub Actions Run
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtsubs-windows10-packages
+          path: |
+            dist/rtsubs-windows10-ready.zip
+            dist/rtsubs-extension.zip
+          if-no-files-found: error
+
+      - name: Create or Update "latest" GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Latest Ready-to-Run Windows 10 & Extension Package"
+          body: |
+            ## 🎬 Real-Time Japanese ➔ Vietnamese Subtitles (`rtsubs`) — Ready to Download & Run
+
+            No manual building required! Choose from the two pre-packaged downloads below:
+
+            1. **`rtsubs-windows10-ready.zip`** *(Complete Windows 10 Bundle)*:
+               - Extract anywhere on your Windows 10 PC.
+               - Load the `extension` folder in Chrome/Edge (`chrome://extensions` or `edge://extensions` -> Enable **Developer mode** -> **Load unpacked**).
+               - Double-click **`run_server.bat`** (automatically creates `.env`, installs Python dependencies on first run, and launches the local server on `127.0.0.1:8765`).
+
+            2. **`rtsubs-extension.zip`** *(Standalone Browser Extension)*:
+               - Extract and load via **Load unpacked** in Chrome, Edge, or Brave.
+          draft: false
+          prerelease: false
+          make_latest: "true"
+          files: |
+            dist/rtsubs-windows10-ready.zip
+            dist/rtsubs-extension.zip

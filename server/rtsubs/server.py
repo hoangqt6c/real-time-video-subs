@@ -1,17 +1,14 @@
-"""Local HTTP API used by the Edge extension.
+"""Local HTTP API used by the browser extension for Real-Time Japanese -> Vietnamese Subtitles.
 
-POST /jobs            {urls, duration?, referer?}  -> {job_id}   (urls: candidates; picked by duration)
+POST /jobs            {urls, duration?, referer?, cookie?, start?} -> {job_id}
 GET  /jobs/{id}       -> status + per-chunk readiness + subtitles
-POST /jobs/{id}/seek  {t}                      -> process chunks near t first
-GET  /jobs/{id}/chunks/{i}.wav                 -> dubbed audio (stereo pcm16 @ mix_sr) for chunk i
+POST /jobs/{id}/seek  {t} -> prioritize chunks at or right after current video playback time t
 """
 from __future__ import annotations
 
-import io
 import subprocess
 import sys
 import threading
-import time
 import uuid
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -19,10 +16,8 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-import numpy as np
-import soundfile as sf
 import uvicorn
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -43,70 +38,112 @@ async def private_network(request, call_next):  # Chrome/Edge Private Network Ac
     return response
 
 
-def _probe_duration(url: str, referer: str | None) -> float | None:
-    """Duration of a URL that carries an audio stream; None for unreachable or video-only URLs
-    (Douyin serves video and audio as separate DASH streams)."""
-    base = ["ffprobe", "-v", "error"]
+def _build_ffmpeg_headers(referer: str | None, cookie: str | None = None, user_agent: str | None = None) -> list[str]:
+    hdrs = []
     if referer:
-        base += ["-headers", f"Referer: {referer}\r\nUser-Agent: Mozilla/5.0\r\n"]
+        hdrs.append(f"Referer: {referer}")
+    if cookie:
+        hdrs.append(f"Cookie: {cookie}")
+    ua = user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    hdrs.append(f"User-Agent: {ua}")
+    return ["-headers", "\r\n".join(hdrs) + "\r\n"]
+
+
+def _probe_duration(url: str, header_args: list[str]) -> float | None:
+    """Duration of a URL that carries an audio stream; None for unreachable or video-only URLs."""
+    base = ["ffprobe", "-v", "error", *header_args]
     try:
-        audio = subprocess.run(base + ["-select_streams", "a", "-show_entries", "stream=codec_type", "-of",
-                                       "csv=p=0", url], capture_output=True, text=True, timeout=20).stdout.strip()
+        audio = subprocess.run(
+            base + ["-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "csv=p=0", url],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        ).stdout.strip()
         if not audio:
             return None
-        out = subprocess.run(base + ["-show_entries", "format=duration", "-of", "default=nw=1:nk=1", url],
-                             capture_output=True, text=True, timeout=20).stdout.strip()
-        return float(out)
+        out = subprocess.run(
+            base + ["-show_entries", "format=duration", "-of", "default=nw=1:nk=1", url],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        ).stdout.strip()
+        try:
+            return float(out)
+        except ValueError:
+            # Live or HLS playlist where format duration is N/A -> still valid audio stream
+            return 0.0
     except Exception:
         return None
 
 
-def resolve_media_url(url: str, referer: str | None = None) -> str:
-    return url
+def _is_hls_manifest(url: str) -> bool:
+    u = url.lower().split("?")[0]
+    return u.endswith(".m3u8") or ".m3u8" in url.lower() or "mpegurl" in url.lower()
 
 
-def pick_url(urls: list[str], duration: float, referer: str | None, exact: bool = False) -> str:
-    """exact=True: the extension traced these URLs to the clicked <video> itself, so take the first one with
-    audio (no duration guessing). Otherwise (fallback scan of the page's requests) the page may also have
-    preloaded other videos: keep URLs with audio and take the closest duration."""
-    if exact:
-        for u in urls:
-            resolved_u = resolve_media_url(u, referer)
-            d = _probe_duration(resolved_u, referer)
-            print(f"[pick exact] {d} {resolved_u[:100]}", flush=True)
-            if d is not None:
-                return resolved_u
-        raise RuntimeError("the video's own stream has no audio track or is not reachable")
-    best, best_err = None, 1e9
-    for u in urls:
-        resolved_u = resolve_media_url(u, referer)
-        d = _probe_duration(resolved_u, referer)
-        print(f"[pick] {d} {resolved_u[:100]}", flush=True)
+def _is_short_segment(url: str) -> bool:
+    u = url.lower().split("?")[0]
+    return u.endswith(".ts") or u.endswith(".m4s")
+
+
+def pick_url(urls: list[str], duration: float, header_args: list[str], exact: bool = False) -> tuple[str, float]:
+    """Select the best media URL.
+    Prioritizes .m3u8 HLS playlists over individual 4-second .ts segments so the entire video can be streamed."""
+    # Sort so .m3u8 manifests come first, full media second, and individual .ts/.m4s segments last
+    ordered = sorted(
+        urls,
+        key=lambda u: (0 if _is_hls_manifest(u) else (2 if _is_short_segment(u) else 1)),
+    )
+
+    best, best_d, best_err = None, 0.0, 1e9
+    for u in ordered:
+        d = _probe_duration(u, header_args)
+        print(f"[pick] duration={d} exact={exact} url={u[:110]}", flush=True)
         if d is None:
             continue
-        err = abs(d - duration) if duration > 0 else 0.0
+        # Reject 2-12s .ts segments when the actual video in the browser is much longer (>25s)
+        if duration > 25.0 and 0 < d < 15.0 and _is_short_segment(u):
+            print(f"[pick] skipping short .ts/.m4s segment ({d:.1f}s vs expected {duration:.1f}s)", flush=True)
+            continue
+        if exact and (duration <= 0 or d == 0.0 or abs(d - duration) <= max(5.0, duration * 0.15)):
+            return u, (d if d > 0 else duration)
+        err = abs(d - duration) if (duration > 0 and d > 0) else 0.0
         if err < best_err:
-            best, best_err = resolved_u, err
-        if duration > 0 and err < 0.3:
+            best, best_d, best_err = u, (d if d > 0 else duration), err
+        if duration > 0 and d > 0 and err < 1.0:
             break
+
     if best is None:
-        raise RuntimeError("no media URL with an audio stream among candidates")
-    if duration > 0 and best_err > 2.0:
-        raise RuntimeError(f"no candidate matches this video's duration ({duration:.1f}s, closest off by {best_err:.1f}s)")
-    return best
+        raise RuntimeError("No reachable media stream with audio found (check if site uses DRM or only exposed a .ts segment)")
+    return best, best_d
 
 
 class Job:
-    def __init__(self, urls: list[str], duration: float, referer: str | None, exact: bool = False, start: float = 0.0,
-                 transcript: list[dict] | None = None, transcript_lang: str | None = None):
+    def __init__(
+        self,
+        urls: list[str],
+        duration: float,
+        referer: str | None,
+        cookie: str | None = None,
+        user_agent: str | None = None,
+        exact: bool = False,
+        start: float = 0.0,
+        transcript: list[dict] | None = None,
+        transcript_lang: str | None = None,
+    ):
         self.id = uuid.uuid4().hex[:8]
-        self.urls, self.expected, self.referer, self.exact = urls, duration, referer, exact
+        self.urls = urls
+        self.expected = duration
+        self.referer = referer
+        self.cookie = cookie
+        self.user_agent = user_agent
+        self.exact = exact
         self.url = ""
         self.state = "loading"  # loading | running | done | error | cancelled
         self.error = ""
         self.duration = 0.0
         self.chunks: list[Chunk] = []
-        self.audio: dict[int, bytes] = {}
+        self.done_chunks: set[int] = set()
         self.subs: dict[int, list[dict]] = {}
         self.timing: dict[int, dict] = {}
         self.pointer = 0
@@ -118,7 +155,7 @@ class Job:
         self.lock = threading.Lock()
 
     def next_chunk(self) -> int | None:
-        todo = [c.index for c in self.chunks if c.index not in self.audio]
+        todo = [c.index for c in self.chunks if c.index not in self.done_chunks]
         if not todo:
             return None
         return next((i for i in todo if i >= self.pointer), todo[0])
@@ -137,6 +174,20 @@ def _engine() -> Engine:
     return engine
 
 
+def _uniform_chunks(duration: float, s: Settings) -> list[Chunk]:
+    """Create clean ~10s chunks immediately when streaming a long .m3u8 so chunk 0 starts without waiting to download the whole movie."""
+    chunks: list[Chunk] = []
+    start = 0.0
+    step = s.chunk_target_sec
+    while start < duration - 1e-3:
+        end = min(duration, start + step)
+        if duration - end < 3.0:
+            end = duration
+        chunks.append(Chunk(len(chunks), round(start, 2), round(end, 2)))
+        start = end
+    return chunks
+
+
 def run_job(job: Job) -> None:
     try:
         if job.cancel.is_set():
@@ -145,8 +196,14 @@ def run_job(job: Job) -> None:
 
         work = S.workspace / "live" / job.id
         work.mkdir(parents=True, exist_ok=True)
+        header_args = _build_ffmpeg_headers(job.referer, job.cookie, job.user_agent)
 
-        is_youtube = any("youtube.com" in u or "youtu.be" in u for u in job.urls) or ("youtube.com" in (job.referer or ""))
+        is_youtube = any("youtube.com" in u or "youtu.be" in u for u in job.urls) or (
+            "youtube.com" in (job.referer or "")
+        )
+        a16 = None
+        stream_url = None
+
         if is_youtube:
             yt_url = next((u for u in job.urls if "youtube.com" in u or "youtu.be" in u), job.urls[0])
             job.url = yt_url
@@ -155,9 +212,11 @@ def run_job(job: Job) -> None:
             def _ydl_hook(d):
                 if job.cancel.is_set():
                     import yt_dlp.utils
+
                     raise yt_dlp.utils.DownloadCancelled("Job cancelled by client")
 
             import yt_dlp
+
             ydl_opts = {
                 "format": "ba/b",
                 "outtmpl": str(work / "source.%(ext)s"),
@@ -177,64 +236,85 @@ def run_job(job: Job) -> None:
             if not src_files:
                 raise RuntimeError("Failed to locate downloaded YouTube audio file")
             src_audio = src_files[0]
-            print(f"[job {job.id}] YouTube audio ready: {src_audio.name} ({src_audio.stat().st_size} bytes)", flush=True)
-
+            print(f"[job {job.id}] YouTube audio ready: {src_audio.name}", flush=True)
             a16 = decode(src_audio, 16000, 1)
-            if job.cancel.is_set():
-                job.state = "cancelled"
-                return
-            a44 = decode(src_audio, S.mix_sr, 2)
+            job.duration = len(a16) / 16000
         else:
-            job.url = pick_url(job.urls, job.expected, job.referer, job.exact)
+            picked_url, probed_dur = pick_url(job.urls, job.expected, header_args, job.exact)
+            job.url = picked_url
             if job.cancel.is_set():
                 job.state = "cancelled"
                 return
-            args = ["-headers", f"Referer: {job.referer}\r\nUser-Agent: Mozilla/5.0\r\n"] if job.referer else []
-            a16 = decode(job.url, 16000, 1, args)
-            if job.cancel.is_set():
-                job.state = "cancelled"
-                return
-            a44 = decode(job.url, S.mix_sr, 2, args)
+
+            # For .m3u8 streams or long videos (> 4 minutes), use windowed streaming so subtitles start in ~1-2 seconds!
+            effective_dur = probed_dur or job.expected
+            if (_is_hls_manifest(picked_url) or effective_dur > 240.0) and effective_dur > 0:
+                print(
+                    f"[job {job.id}] Using real-time windowed stream mode for {picked_url[:90]} (duration={effective_dur:.1f}s)",
+                    flush=True,
+                )
+                stream_url = picked_url
+                job.duration = effective_dur
+            else:
+                a16 = decode(job.url, 16000, 1, header_args)
+                job.duration = len(a16) / 16000
 
         if job.cancel.is_set():
             job.state = "cancelled"
             return
-        job.duration = len(a16) / 16000
 
         if job.transcript and len(job.transcript) > 0:
-            print(f"[job {job.id}] Using pre-existing transcript ({len(job.transcript)} cues, lang={job.transcript_lang})", flush=True)
-            speech = [(float(c["start"]), float(c["end"])) for c in job.transcript if float(c.get("end", 0)) > float(c.get("start", 0))]
-            if not speech:
-                speech = speech_timestamps(a16)
-        else:
+            print(
+                f"[job {job.id}] Using pre-existing transcript ({len(job.transcript)} cues, lang={job.transcript_lang})",
+                flush=True,
+            )
+            speech = [
+                (float(c["start"]), float(c["end"]))
+                for c in job.transcript
+                if float(c.get("end", 0)) > float(c.get("start", 0))
+            ]
+            job.chunks = plan_chunks(job.duration, speech, S) if speech else _uniform_chunks(job.duration, S)
+        elif a16 is not None:
             speech = speech_timestamps(a16)
+            job.chunks = plan_chunks(job.duration, speech, S)
+        else:
+            job.chunks = _uniform_chunks(job.duration, S)
 
-        job.chunks = plan_chunks(job.duration, speech, S)
         if job.initial_start > 0:
             for c in job.chunks:
                 if c.start <= job.initial_start < c.end:
                     job.pointer = c.index
                     break
+
         if job.cancel.is_set():
             job.state = "cancelled"
             return
+
         with gpu_lock:
             if job.cancel.is_set():
                 job.state = "cancelled"
                 return
             eng, tr = _engine(), Translator(S)
-        session = VideoSession(eng, tr, a16, a44, job.chunks, transcript=job.transcript, transcript_lang=job.transcript_lang)
+
+        session = VideoSession(
+            eng,
+            tr,
+            a16,
+            job.chunks,
+            transcript=job.transcript,
+            transcript_lang=job.transcript_lang,
+            stream_url=stream_url,
+            stream_args=header_args,
+        )
         job.session = session
+        job.state = "running"
+
         with gpu_lock:
             if job.cancel.is_set():
                 job.state = "cancelled"
                 return
-            session.warm_up()  # ASR the first ~minute + story bible, then read ahead in the background
-        if job.cancel.is_set():
-            job.state = "cancelled"
-            session.cancel.set()
-            return
-        job.state = "running"
+            session.warm_up(start_index=job.pointer)
+
         while not job.cancel.is_set():
             i = job.next_chunk()
             if i is None or job.cancel.is_set():
@@ -243,15 +323,20 @@ def run_job(job: Job) -> None:
             with gpu_lock:
                 if job.cancel.is_set():
                     break
-                mixed, subs, timing = session.process(i, work, cancel_event=job.cancel)
+                subs, timing = session.process(i, cancel_event=job.cancel)
             if job.cancel.is_set():
                 break
-            buf = io.BytesIO()
-            sf.write(buf, mixed, S.mix_sr, format="WAV", subtype="PCM_16")
             with job.lock:
-                job.audio[i], job.subs[i], job.timing[i] = buf.getvalue(), subs, timing
-            print(f"[job {job.id}] chunk {i} {c.end - c.start:.1f}s {timing} "
-                  f"RTF={timing['total'] / (c.end - c.start):.2f}", flush=True)
+                job.done_chunks.add(i)
+                job.subs[i] = subs
+                job.timing[i] = timing
+            dur = max(0.1, c.end - c.start)
+            print(
+                f"[job {job.id}] chunk {i}/{len(job.chunks)} ({c.start:.1f}s-{c.end:.1f}s) "
+                f"{len(subs)} subs | {timing} RTF={timing.get('total', 0.0) / dur:.2f}",
+                flush=True,
+            )
+
         session.cancel.set()
         job.state = "cancelled" if job.cancel.is_set() else "done"
         print(f"[job {job.id}] finished with state: {job.state}", flush=True)
@@ -272,6 +357,8 @@ class NewJob(BaseModel):
     exact: bool = False
     duration: float = 0.0
     referer: str | None = None
+    cookie: str | None = None
+    user_agent: str | None = None
     start: float = 0.0
     transcript: list[dict] | None = None
     transcript_lang: str | None = None
@@ -289,7 +376,17 @@ def create_job(req: NewJob):
         if current.session:
             current.session.cancel.set()
         current.state = "cancelled"
-    job = Job(req.urls, req.duration, req.referer, req.exact, start=req.start, transcript=req.transcript, transcript_lang=req.transcript_lang)
+    job = Job(
+        req.urls,
+        req.duration,
+        req.referer,
+        cookie=req.cookie,
+        user_agent=req.user_agent,
+        exact=req.exact,
+        start=req.start,
+        transcript=req.transcript,
+        transcript_lang=req.transcript_lang,
+    )
     jobs[job.id] = current = job
     threading.Thread(target=run_job, args=(job,), daemon=True).start()
     return {"job_id": job.id}
@@ -334,38 +431,35 @@ def status(job_id: str):
     j = _job(job_id)
     with j.lock:
         return {
-            "state": j.state, "error": j.error, "duration": j.duration,
-            "chunks": [{"i": c.index, "start": c.start, "end": c.end, "ready": c.index in j.audio} for c in j.chunks],
+            "state": j.state,
+            "error": j.error,
+            "duration": j.duration,
+            "chunks": [
+                {"i": c.index, "start": c.start, "end": c.end, "ready": c.index in j.done_chunks} for c in j.chunks
+            ],
             "subs": [s for i in sorted(j.subs) for s in j.subs[i]],
-            "sample_rate": S.mix_sr,
         }
 
 
 @app.post("/jobs/{job_id}/seek")
 def seek(job_id: str, req: Seek):
     j = _job(job_id)
-    j.pointer = next((c.index for c in j.chunks if c.start <= req.t < c.end), 0)
+    target = next((c.index for c in j.chunks if c.start <= req.t < c.end), None)
+    if target is not None:
+        j.pointer = target
+        if j.session:
+            j.session.play_time = req.t
     return {"pointer": j.pointer}
-
-
-@app.get("/jobs/{job_id}/chunks/{index}.wav")
-def chunk_audio(job_id: str, index: int):
-    j = _job(job_id)
-    with j.lock:
-        data = j.audio.get(index)
-    if data is None:
-        raise HTTPException(404, "chunk not ready")
-    return Response(data, media_type="audio/wav")
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "engine_loaded": engine is not None}
+    return {"ok": True, "engine_loaded": engine is not None, "mode": "subtitle_only"}
 
 
 def main() -> None:
-    _engine()  # load models up front so the first request is not slow
-    print("[server] models ready", flush=True)
+    _engine()  # load Whisper model up front so the first request is fast
+    print("[server] Whisper ASR ready (Subtitle-Only mode)", flush=True)
     uvicorn.run(app, host="127.0.0.1", port=8765, log_level="warning")
 
 
