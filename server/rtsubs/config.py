@@ -14,7 +14,9 @@ def _load_env() -> None:
     for line in env.read_text(encoding="utf-8").splitlines():
         if "=" in line and not line.lstrip().startswith("#"):
             key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip())
+            val = value.strip()
+            if val:
+                os.environ.setdefault(key.strip(), val)
 
 
 _load_env()
@@ -30,9 +32,17 @@ class Settings:
     chunk_target_sec: float = 10.0
     chunk_max_sec: float = 14.0
     chars_per_sec: float = 28.0  # Comfortable subtitle reading budget (no TTS speed constraints)
-    base_url: str = field(default_factory=lambda: os.environ.get("TRANSLATION_BASE_URL", ""))
-    api_key: str = field(default_factory=lambda: os.environ.get("OPENAI_API_KEY", "") or "dummy")
-    model: str = field(default_factory=lambda: os.environ.get("TRANSLATION_MODEL", ""))
+    base_url: str = field(
+        default_factory=lambda: os.environ.get("TRANSLATION_BASE_URL", "") or "https://openrouter.ai/api/v1"
+    )
+    api_key: str = field(
+        default_factory=lambda: os.environ.get("OPENROUTER_API_KEY", "")
+        or os.environ.get("OPENAI_API_KEY", "")
+        or "dummy"
+    )
+    model: str = field(
+        default_factory=lambda: os.environ.get("TRANSLATION_MODEL", "") or "google/gemma-3-27b-it"
+    )
     context_pairs: int = 12
     story_lookahead_sec: float = 120.0  # background ASR stays up to 2 minutes ahead of playback
     bible_every: int = 3  # rebuild the story bible after this many newly transcribed chunks
