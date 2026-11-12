@@ -1,10 +1,10 @@
 # Changelog — RT-Subs (Japanese ➔ Vietnamese 18+ Real-Time Subtitles)
 
 ## Latest Update Highlights (v1.2)
-- **Free-First OpenRouter Model Router & Adaptive Token/Chunk Scaler (`config.py` & `translate.py`)**:
-  - **Always Prioritizes `:free` OpenRouter Models First (`0` credits/token)**: Queries OpenRouter's live `/api/v1/models` list at startup and builds an automatic fallback chain of active `:free` models (`google/gemma-3-27b-it:free`, `deepseek/deepseek-chat-v3-0324:free`, `qwen/qwen-2.5-72b-instruct:free`, `meta-llama/llama-3.3-70b-instruct:free`, etc.). Automatically rotates to the next `:free` model if a model is rate-limited (`429`).
-  - **Compact 600-Token Story Bible**: Shrunk Story Bible `max_tokens` from `4000` down to **`600` tokens** (`BIBLE_MAX_TOKENS=600`).
-  - **Dynamic Right-Sized `max_tokens` & Automatic `402` Credit Adaptation**: Instead of requesting a fixed `8192` tokens, calculates `max_tokens` dynamically from the exact line count (`~55 tokens × lines + 120`). If OpenRouter ever reports `402 ... can only afford X`, the server parses `X` and automatically shrinks `token_ceiling`, `max_lines_per_batch`, and `mega_batch_sec` to fit.
+- **Strict 100% `:free` Highest-Token Model Selector (`config.py` & `translate.py`)**:
+  - **100% `$0` `:free` Models Only (Never Uses Paid Models)**: Queries OpenRouter's live `/api/v1/models` catalog at startup, filters strictly for `$0` prompt & `$0` completion `:free` models, and sorts them by **highest token capacity (`context_length` + `max_completion_tokens`)** and multilingual JA➔VI quality (`google/gemma-3-27b-it:free`, `deepseek/deepseek-chat-v3-0324:free`, `qwen/qwen3-235b-a22b:free`, `meta-llama/llama-3.3-70b-instruct:free`, etc., plus `openrouter/free`). Even if your existing `.env` has a non-`:free` model name, paid models are strictly blocked so your credit balance never decreases.
+  - **85% Smaller Translation Prompt (~950 Tokens vs 6,576 Tokens)**: Removed the redundant 5,000-token raw movie transcript from `translate()` calls (since the Webpage Plot Summary + 600-token Story Bible + recent dialogue lines already provide full context).
+  - **Dynamic `max_tokens` & Automatic Prompt/Token Scaling**: Calculates `max_tokens` from the exact line count (`~55 tokens × lines + 120`) and automatically adapts if any provider reports a prompt or completion token limit.
 - **Adaptive 15s First-Chunk + 150s Mega-Batch Engine (`server.py`, `pipeline.py`, `translate.py`)**:
   - **Tier 1 (Instant 15s Playhead Chunk)**: Processes a **15-second** chunk first when starting a video or seeking to an untranslated timestamp so subtitles appear on screen in **~1.5 seconds**.
   - **Tier 2 (150s / 2.5-Minute Mega-Batches)**: Immediately after the playhead chunk is ready, groups consecutive chunks into one contiguous pass—downloading HLS segments in parallel (8 threads) and transcribing contiguous audio in a single Faster-Whisper call.

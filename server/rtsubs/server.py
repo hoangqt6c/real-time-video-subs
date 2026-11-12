@@ -875,17 +875,17 @@ def main() -> None:
         if (S.api_key and S.api_key != "dummy" and len(S.api_key) > 14)
         else "NOT SET (Check .env!)"
     )
-    fallbacks = " -> ".join(S.model_chain[1:5]) if len(S.model_chain) > 1 else "none"
+    fallbacks = " -> ".join(S.format_model_info(m) for m in S.model_chain[1:5]) if len(S.model_chain) > 1 else "none"
     print("============================================================", flush=True)
     print(f"[Config] Source Language   : {S.source_language} (Whisper model: {S.whisper_model})", flush=True)
     print(
         f"[Config] Chunking Mode     : {S.chunk_target_sec:.0f}s First Chunk -> {S.mega_batch_sec:.0f}s Mega-Batches "
-        f"(dynamic tokens, Story Bible={S.bible_max_tokens} tokens)",
+        f"(lean ~950-token prompt, Story Bible={S.bible_max_tokens} tokens)",
         flush=True,
     )
-    print(f"[Config] Model Strategy    : {'FREE-FIRST (:free tier priority)' if S.prefer_free_models else 'Custom .env'}", flush=True)
-    print(f"[Config] Primary Model     : {S.model}", flush=True)
-    print(f"[Config] Fallback Models   : {fallbacks}", flush=True)
+    print("[Config] Model Strategy    : STRICT 100% FREE (:free models sorted by highest token limit)", flush=True)
+    print(f"[Config] Primary Free Model: {S.format_model_info(S.model)} ($0/token)", flush=True)
+    print(f"[Config] Free Fallbacks    : {fallbacks}", flush=True)
     print(f"[Config] OpenRouter Key    : {masked_key}", flush=True)
     print(f"[Config] Subtitle Cache    : {CACHE_DIR}", flush=True)
     print("============================================================", flush=True)

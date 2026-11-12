@@ -1,9 +1,10 @@
 """JA->VI subtitle translation tuned for natural, sensual, uncensored 18+ dialogue,
 with:
-- Free-First OpenRouter Model Router (:free tier priority + automatic fallback rotation on 429/402/5xx)
+- Strict 100% :free OpenRouter Model Router sorted by highest token capacity (never uses paid models)
+- Lean ~950-token translation prompt (omits redundant raw full-movie transcript from translate calls)
 - Compact 600-token Story Bible
 - Dynamic right-sized `max_tokens` per batch (~55 tokens/line + 120 buffer)
-- Automatic token & chunk-length adaptation when OpenRouter reports 'can only afford X tokens' (HTTP 402)
+- Automatic rotation & prompt/completion token scaling
 """
 from __future__ import annotations
 
@@ -19,8 +20,7 @@ SYSTEM = """Bạn là dịch giả phụ đề phim người lớn (18+ / NSFW /
 
 # Dữ liệu bạn nhận (theo thứ tự)
 1. BỐI CẢNH TRANG WEB & STORY BIBLE: tiêu đề phim, mã phim (ví dụ MEYD-916), tóm tắt nội dung cốt truyện từ trang web (NTR, hàng xóm, vợ chồng, công sở, chị em, thầy trò...), tên nhân vật, vai vế và cách xưng hô.
-2. TRANSCRIPT: lời thoại gốc của video để nắm bắt bối cảnh, diễn biến cảm xúc và cao trào. KHÔNG dịch phần này.
-3. Yêu cầu dịch, là JSON gồm:
+2. Yêu cầu dịch, là JSON gồm:
    - previous_lines: vài câu liền trước (gốc + vi + speaker) để nối mạch cảm xúc và xưng hô. KHÔNG dịch lại.
    - translate: danh sách các câu cần dịch theo thứ tự thoại, mỗi câu là {id, speaker, zh, max_chars} trong đó:
      * `speaker`: "Nam" (giọng đàn ông) hoặc "Nữ" (giọng phụ nữ) được phân tích trực tiếp từ tần số âm thanh giọng nói.
@@ -65,6 +65,7 @@ BIBLE_CAPS = {"characters": 6, "terminology": 10, "asr_fixes": 8}
 EMPTY_BIBLE_TEXT = "[STORY BIBLE]\n(chưa có — ưu tiên xưng hô theo đúng giới tính giọng nói Nam='anh', Nữ='em' tình tứ, gợi cảm)\n[HẾT STORY BIBLE]"
 
 _AFFORD_RE = re.compile(r"can only afford\s+(\d+)", re.IGNORECASE)
+_PROMPT_LIMIT_RE = re.compile(r"Prompt tokens limit exceeded:\s*(\d+)\s*>\s*(\d+)", re.IGNORECASE)
 
 
 def _canon(obj) -> str:
@@ -152,8 +153,8 @@ class Translator:
         self.model_chain: list[str] = list(s.model_chain) if s.model_chain else [s.model]
         self.model_idx: int = 0
         self.video_code = (video_code or "").strip()
-        self.page_title = (page_title or "").strip()
-        self.page_summary = (page_summary or "").strip()
+        self.page_title = (page_title or "").strip()[:200]
+        self.page_summary = (page_summary or "").strip()[:1200]
         self.page_context_block = self._build_page_context_block()
         self.bible: dict = initial_bible if isinstance(initial_bible, dict) and initial_bible else {}
         if self.bible:
@@ -162,7 +163,6 @@ class Translator:
             self._bible_text = self.page_context_block + "\n\n" + EMPTY_BIBLE_TEXT
         else:
             self._bible_text = EMPTY_BIBLE_TEXT
-        self._transcript_text = ""
 
     @property
     def active_model(self) -> str:
@@ -174,34 +174,39 @@ class Translator:
             self.model_idx = (self.model_idx + 1) % len(self.model_chain)
             self.s.model = self.active_model
             print(
-                f"[OpenRouter Router] Switching model '{old_model}' -> '{self.active_model}' ({reason})",
+                f"[OpenRouter Free Router] Switching :free model '{old_model}' -> "
+                f"'{self.s.format_model_info(self.active_model)}' ({reason})",
                 flush=True,
             )
         return self.active_model
 
     def _handle_api_exception(self, exc: Exception, step_label: str) -> None:
         msg = str(exc)
-        # 1. Check if OpenRouter returned 402 with "can only afford X"
-        m = _AFFORD_RE.search(msg)
-        if m:
-            affordable = int(m.group(1))
-            self.s.adapt_to_token_limit(affordable)
-            # If the current model is not a :free model, switch to a :free model immediately!
-            if not self.active_model.endswith(":free") and any(x.endswith(":free") for x in self.model_chain):
-                for idx, candidate in enumerate(self.model_chain):
-                    if candidate.endswith(":free"):
-                        self.model_idx = idx
-                        self.s.model = candidate
-                        print(
-                            f"[OpenRouter Router] Credit limit hit on paid model -> switched to FREE model '{candidate}'",
-                            flush=True,
-                        )
-                        break
+        # 1. Check if OpenRouter reported "Prompt tokens limit exceeded: X > Y"
+        mp = _PROMPT_LIMIT_RE.search(msg)
+        if mp:
+            allowed_prompt = int(mp.group(2))
+            self.s.adapt_to_prompt_limit(allowed_prompt)
+            self.page_summary = self.page_summary[:500]
+            self.page_context_block = self._build_page_context_block()
+            with self._lock:
+                if self.bible:
+                    self._bible_text = _bible_message(self.bible, self.page_context_block)
+                elif self.page_context_block:
+                    self._bible_text = self.page_context_block + "\n\n" + EMPTY_BIBLE_TEXT
+            self._rotate_model(f"{step_label} prompt limit")
             return
 
-        # 2. Rotate model on 429 (rate limit), 402 (credits), 404 (retired model), or 502/503 (provider down)
-        if any(code in msg for code in ("429", "402", "404", "502", "503", "rate", "No endpoints", "Provider returned error")):
-            self._rotate_model(f"{step_label}: {msg[:100]}")
+        # 2. Check if OpenRouter reported "can only afford X"
+        ma = _AFFORD_RE.search(msg)
+        if ma:
+            affordable = int(ma.group(1))
+            self.s.adapt_to_token_limit(affordable)
+            self._rotate_model(f"{step_label} token limit ({affordable})")
+            return
+
+        # 3. Rotate to next :free model on any rate-limit (429), 402, 404, or provider error
+        self._rotate_model(f"{step_label}: {msg[:90]}")
 
     def _build_page_context_block(self) -> str:
         lines = []
@@ -248,20 +253,18 @@ class Translator:
                 print(f"[bible] warning ({self.active_model}, max_tokens={bible_tokens}): {exc}", flush=True)
                 self._handle_api_exception(exc, "bible")
         with self._lock:
-            if transcript:
-                self._transcript_text = transcript
             if bible is not None:
                 self.bible = bible
                 self._bible_text = _bible_message(bible, self.page_context_block)
         if bible is not None:
             print(
-                f"[bible] Built Story Bible (max_tokens={self.s.bible_max_tokens}) from page summary + {len(lines)} lines: "
+                f"[bible] Built Story Bible (max_tokens={self.s.bible_max_tokens}, model={self.active_model}): "
                 f"{len(bible['characters'])} characters, {len(bible['terminology'])} terms",
                 flush=True,
             )
 
     def translate(self, segs: list[Seg], slots: list[float]) -> None:
-        """Translate a list of segments using dynamic right-sized `max_tokens` and adaptive sub-batching."""
+        """Translate segments using strictly :free models, lean ~950-token prompt, and dynamic max_tokens."""
         if not segs:
             return
         if all(bool(g.vi) for g in segs):
@@ -292,25 +295,27 @@ class Translator:
         male_cnt = sum(1 for g in segs if g.gender == "male")
         female_cnt = len(segs) - male_cnt
 
-        with self._lock:
-            bible_text, transcript_text = self._bible_text, self._transcript_text
-
         result: dict[int, str] = {}
         missing_ids = list(range(len(segs)))
 
-        for attempt in range(1, 5):
-            # Dynamically calculate max_tokens needed for the exact number of lines (~55 tokens per line + 120 buffer)
-            needed_tokens = max(250, len(missing_ids) * 55 + 120)
-            req_max_tokens = min(self.s.token_ceiling, needed_tokens)
+        for attempt in range(1, 6):
+            with self._lock:
+                bible_text = self._bible_text
 
-            # If token_ceiling was shrunk below what missing_ids needs, slice missing_ids to fit!
+            # Dynamically calculate max_tokens needed for the exact number of lines (~55 tokens per line + 120 buffer)
+            _, model_max_out = self.s.model_token_info.get(self.active_model, (131072, 4096))
+            effective_ceiling = min(self.s.token_ceiling, model_max_out)
+            needed_tokens = max(250, len(missing_ids) * 55 + 120)
+            req_max_tokens = min(effective_ceiling, needed_tokens)
+
             max_fit_lines = max(3, (req_max_tokens - 100) // 55)
             active_ids = missing_ids[:max_fit_lines]
-            req_max_tokens = min(self.s.token_ceiling, max(250, len(active_ids) * 55 + 120))
+            req_max_tokens = min(effective_ceiling, max(250, len(active_ids) * 55 + 120))
 
             print(
                 f"[Step 3/3 - OpenRouter VI] Uploading {len(active_ids)}/{len(segs)} Japanese line(s) "
-                f"(Nữ={female_cnt}, Nam={male_cnt}) -> model='{self.active_model}' (dynamic max_tokens={req_max_tokens})...",
+                f"(Nữ={female_cnt}, Nam={male_cnt}) -> FREE model='{self.s.format_model_info(self.active_model)}' "
+                f"(dynamic max_tokens={req_max_tokens})...",
                 flush=True,
             )
 
@@ -327,10 +332,12 @@ class Translator:
                     for idx in active_ids
                 ],
             }
-            messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": bible_text}]
-            if transcript_text:
-                messages.append({"role": "user", "content": transcript_text})
-            messages.append({"role": "user", "content": json.dumps(req, ensure_ascii=False)})
+            # Lean Prompt: ONLY System Prompt + Story Bible/Summary + Current Translation Request (NO 5,000-token raw transcript!)
+            messages = [
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": bible_text},
+                {"role": "user", "content": json.dumps(req, ensure_ascii=False)},
+            ]
 
             try:
                 r = self.client.chat.completions.create(
@@ -350,14 +357,17 @@ class Translator:
                     flush=True,
                 )
             except Exception as exc:
-                print(f"[Step 3/3 - OpenRouter WARNING] Attempt {attempt}/4 on '{self.active_model}' failed: {exc}", flush=True)
+                print(
+                    f"[Step 3/3 - OpenRouter WARNING] Attempt {attempt}/5 on '{self.active_model}' failed: {exc}",
+                    flush=True,
+                )
                 self._handle_api_exception(exc, "translate")
 
         elapsed = time.time() - t0
         if result:
             print(
                 f"[Step 3/3 - OpenRouter VI] SUCCESS! Translated {len(result)}/{len(segs)} line(s) in {elapsed:.2f}s "
-                f"(model={self.active_model}):",
+                f"(FREE model={self.active_model}):",
                 flush=True,
             )
         else:
