@@ -19,43 +19,24 @@ from .chunker import Chunk
 from .config import Settings
 from .translate import Translator
 
+HLS_INPUT_ARGS = [
+    "-allowed_extensions",
+    "ALL",
+    "-protocol_whitelist",
+    "file,http,https,tcp,tls,crypto,data",
+]
+
+
+def _extra_demux_args(path: str | Path) -> list[str]:
+    s = str(path).lower()
+    if ".m3u8" in s or "mpegurl" in s:
+        return HLS_INPUT_ARGS
+    return []
+
 
 def decode(path: str | Path, sr: int = 16000, ch: int = 1, input_args: list[str] | None = None) -> np.ndarray:
     """Decode audio from a file, direct URL, or .m3u8 playlist into float32 mono 16kHz PCM."""
-    raw = subprocess.run(
-        [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-reconnect",
-            "1",
-            "-reconnect_streamed",
-            "1",
-            "-reconnect_delay_max",
-            "5",
-            *(input_args or []),
-            "-i",
-            str(path),
-            "-vn",
-            "-ac",
-            str(ch),
-            "-ar",
-            str(sr),
-            "-f",
-            "f32le",
-            "-",
-        ],
-        capture_output=True,
-        check=True,
-    ).stdout
-    a = np.frombuffer(raw, dtype=np.float32)
-    return a.reshape(-1, ch) if ch > 1 else a.copy()
-
-
-def decode_window(
-    path: str | Path, start: float, duration: float, sr: int = 16000, input_args: list[str] | None = None
-) -> np.ndarray:
-    """Decode a specific [start, start+duration] time slice from a URL / .m3u8 playlist quickly via ffmpeg -ss."""
+    print(f"[FFmpeg] Decoding full audio stream from: {str(path)[:100]} ...", flush=True)
     cmd = [
         "ffmpeg",
         "-v",
@@ -67,6 +48,45 @@ def decode_window(
         "-reconnect_delay_max",
         "5",
         *(input_args or []),
+        *_extra_demux_args(path),
+        "-i",
+        str(path),
+        "-vn",
+        "-ac",
+        str(ch),
+        "-ar",
+        str(sr),
+        "-f",
+        "f32le",
+        "-",
+    ]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        err_msg = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"FFmpeg decode failed: {err_msg[:300]}")
+    a = np.frombuffer(proc.stdout, dtype=np.float32)
+    dur = len(a) / (sr * ch) if len(a) > 0 else 0.0
+    print(f"[FFmpeg] Decoded {dur:.1f}s of audio into memory.", flush=True)
+    return a.reshape(-1, ch) if ch > 1 else a.copy()
+
+
+def decode_window(
+    path: str | Path, start: float, duration: float, sr: int = 16000, input_args: list[str] | None = None
+) -> np.ndarray:
+    """Decode a specific [start, start+duration] time slice from a URL / .m3u8 playlist quickly via ffmpeg -ss."""
+    print(f"[FFmpeg] Streaming audio window {start:.1f}s -> {start + duration:.1f}s ...", flush=True)
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_delay_max",
+        "5",
+        *(input_args or []),
+        *_extra_demux_args(path),
     ]
     if start > 0:
         cmd += ["-ss", f"{start:.2f}"]
@@ -86,8 +106,12 @@ def decode_window(
         "f32le",
         "-",
     ]
-    raw = subprocess.run(cmd, capture_output=True, check=True).stdout
-    return np.frombuffer(raw, dtype=np.float32).copy()
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        err_msg = proc.stderr.decode("utf-8", errors="replace").strip()
+        print(f"[FFmpeg] Warning on window {start:.1f}s: {err_msg[:240]}", flush=True)
+        return np.zeros(0, dtype=np.float32)
+    return np.frombuffer(proc.stdout, dtype=np.float32).copy()
 
 
 class Engine:
@@ -263,6 +287,9 @@ def process_chunk(
     else:
         tr.translate(segs, slots)
         t_tr = time.time() - t
+        for g in segs:
+            if g.vi.strip():
+                print(f"   [VI {g.start:6.1f}s -> {min(g.end, c.end):6.1f}s] {g.vi}", flush=True)
 
     subs = [
         {"start": round(g.start, 2), "end": round(min(g.end, c.end), 2), "zh": g.zh, "vi": g.vi}

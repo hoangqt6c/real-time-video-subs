@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 import numpy as np
 
@@ -29,13 +32,24 @@ class Asr:
         self.s = s
         device = "cuda" if torch.cuda.is_available() else "cpu"
         compute = s.whisper_compute if device == "cuda" else "int8"
+        print(
+            f"[Whisper] Loading model '{s.whisper_model}' on {device.upper()} ({compute})... "
+            f"(First run downloads ~1.6GB from HuggingFace, please wait)",
+            flush=True,
+        )
         self.model = WhisperModel(s.whisper_model, device=device, compute_type=compute)
+        print(f"[Whisper] Model '{s.whisper_model}' loaded and ready on {device.upper()}!", flush=True)
 
     def transcribe(self, audio16k: np.ndarray, offset: float) -> list[Seg]:
         lang = (self.s.source_language or "").strip().lower()
         if lang in ("", "auto", "none"):
             lang = None
         prompt = JA_INITIAL_PROMPT if lang == "ja" else None
+        dur = len(audio16k) / 16000.0
+        print(
+            f"[Whisper] Transcribing audio chunk {offset:.1f}s -> {offset + dur:.1f}s (lang={lang or 'auto'})...",
+            flush=True,
+        )
         segs, _ = self.model.transcribe(
             audio16k,
             language=lang,
@@ -55,5 +69,9 @@ class Asr:
         for g in segs:
             text = g.text.strip()
             if text and g.no_speech_prob < 0.90:
-                out.append(Seg(offset + g.start, offset + g.end, text))
+                seg = Seg(offset + g.start, offset + g.end, text)
+                out.append(seg)
+                print(f"   [JA {seg.start:6.1f}s -> {seg.end:6.1f}s] {seg.zh}", flush=True)
+        if not out:
+            print(f"   [Whisper] (No speech detected in {offset:.1f}s -> {offset + dur:.1f}s)", flush=True)
         return out

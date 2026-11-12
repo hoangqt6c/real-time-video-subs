@@ -5,6 +5,7 @@ if /i not "%~1"=="__keep_open__" cmd /k ""%~f0" __keep_open__" & exit /b
 title RT-Subs JA to VI Real-Time Subtitles Server
 cd /d "%~dp0"
 set PYTHONIOENCODING=utf-8
+set HF_HUB_DISABLE_SYMLINKS_WARNING=1
 
 echo ============================================================================
 echo   RT-Subs: Real-Time Japanese to Vietnamese Subtitle Server - Windows 10

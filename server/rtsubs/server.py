@@ -9,6 +9,8 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
+import urllib.parse
+import urllib.request
 import uuid
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -23,7 +25,7 @@ from pydantic import BaseModel
 
 from .chunker import Chunk, plan_chunks, speech_timestamps
 from .config import Settings
-from .pipeline import Engine, VideoSession, decode
+from .pipeline import HLS_INPUT_ARGS, Engine, VideoSession, decode
 from .translate import Translator
 
 S = Settings()
@@ -38,42 +40,47 @@ async def private_network(request, call_next):  # Chrome/Edge Private Network Ac
     return response
 
 
-def _build_ffmpeg_headers(referer: str | None, cookie: str | None = None, user_agent: str | None = None) -> list[str]:
+def _same_domain(url_a: str | None, url_b: str | None) -> bool:
+    if not url_a or not url_b:
+        return False
+    try:
+        ha = urllib.parse.urlparse(url_a).hostname or ""
+        hb = urllib.parse.urlparse(url_b).hostname or ""
+        return ha.lower().lstrip("www.") == hb.lower().lstrip("www.")
+    except Exception:
+        return False
+
+
+def _origin_of(referer: str | None) -> str | None:
+    if not referer:
+        return None
+    try:
+        p = urllib.parse.urlparse(referer)
+        if p.scheme and p.netloc:
+            return f"{p.scheme}://{p.netloc}"
+    except Exception:
+        pass
+    return None
+
+
+def _build_ffmpeg_headers(
+    target_url: str, referer: str | None, cookie: str | None = None, user_agent: str | None = None
+) -> list[str]:
     hdrs = []
     if referer:
         hdrs.append(f"Referer: {referer}")
-    if cookie:
+        origin = _origin_of(referer)
+        if origin:
+            hdrs.append(f"Origin: {origin}")
+    # Only send cookies if target_url is on the same domain as the page (sending missav.ws cookies to surrit.com triggers Cloudflare 403)
+    if cookie and _same_domain(target_url, referer):
         hdrs.append(f"Cookie: {cookie}")
-    ua = user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ua = (
+        user_agent
+        or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    )
     hdrs.append(f"User-Agent: {ua}")
     return ["-headers", "\r\n".join(hdrs) + "\r\n"]
-
-
-def _probe_duration(url: str, header_args: list[str]) -> float | None:
-    """Duration of a URL that carries an audio stream; None for unreachable or video-only URLs."""
-    base = ["ffprobe", "-v", "error", *header_args]
-    try:
-        audio = subprocess.run(
-            base + ["-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "csv=p=0", url],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        ).stdout.strip()
-        if not audio:
-            return None
-        out = subprocess.run(
-            base + ["-show_entries", "format=duration", "-of", "default=nw=1:nk=1", url],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        ).stdout.strip()
-        try:
-            return float(out)
-        except ValueError:
-            # Live or HLS playlist where format duration is N/A -> still valid audio stream
-            return 0.0
-    except Exception:
-        return None
 
 
 def _is_hls_manifest(url: str) -> bool:
@@ -86,18 +93,95 @@ def _is_short_segment(url: str) -> bool:
     return u.endswith(".ts") or u.endswith(".m4s")
 
 
-def pick_url(urls: list[str], duration: float, header_args: list[str], exact: bool = False) -> tuple[str, float]:
+def _probe_hls_manifest_fast(url: str, referer: str | None, user_agent: str | None) -> float | None:
+    """Fast HTTP check for .m3u8 playlists (like surrit.com/missav.ws).
+    Parses #EXTINF segment durations directly in <0.5s instead of waiting 20s for ffprobe to scan 1,500 segments!"""
+    try:
+        headers = {
+            "User-Agent": user_agent
+            or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+        }
+        if referer:
+            headers["Referer"] = referer
+            origin = _origin_of(referer)
+            if origin:
+                headers["Origin"] = origin
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            text = resp.read(512_000).decode("utf-8", errors="ignore")
+        if "#EXTM3U" not in text:
+            return None
+        # Sum #EXTINF:<seconds>, if this is a media playlist (like 1080p/video.m3u8)
+        total = 0.0
+        for line in text.splitlines():
+            if line.startswith("#EXTINF:"):
+                val = line[8:].split(",")[0].strip()
+                try:
+                    total += float(val)
+                except ValueError:
+                    pass
+        if total > 0:
+            return round(total, 2)
+        # Master playlist (#EXT-X-STREAM-INF) -> valid playlist, duration will come from browser or sub-playlist
+        return 0.0
+    except Exception as e:
+        print(f"[hls-probe] HTTP check failed for {url[:90]}: {e}", flush=True)
+        return None
+
+
+def _probe_duration(url: str, header_args: list[str], referer: str | None = None, user_agent: str | None = None) -> float | None:
+    """Duration of a URL that carries an audio/media stream."""
+    if _is_hls_manifest(url):
+        fast_dur = _probe_hls_manifest_fast(url, referer, user_agent)
+        if fast_dur is not None:
+            return fast_dur
+
+    extra = HLS_INPUT_ARGS if _is_hls_manifest(url) else []
+    base = ["ffprobe", "-v", "error", *header_args, *extra]
+    try:
+        audio = subprocess.run(
+            base + ["-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "csv=p=0", url],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        ).stdout.strip()
+        if not audio:
+            return None
+        out = subprocess.run(
+            base + ["-show_entries", "format=duration", "-of", "default=nw=1:nk=1", url],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        ).stdout.strip()
+        try:
+            return float(out)
+        except ValueError:
+            return 0.0
+    except Exception:
+        return None
+
+
+def pick_url(
+    urls: list[str],
+    duration: float,
+    referer: str | None,
+    cookie: str | None,
+    user_agent: str | None,
+    exact: bool = False,
+) -> tuple[str, float, list[str]]:
     """Select the best media URL.
-    Prioritizes .m3u8 HLS playlists over individual 4-second .ts segments so the entire video can be streamed."""
-    # Sort so .m3u8 manifests come first, full media second, and individual .ts/.m4s segments last
+    Prioritizes specific .m3u8 media playlists (e.g. 1080p/video.m3u8) and master playlists (playlist.m3u8)
+    over individual 4-second .ts segments."""
     ordered = sorted(
         urls,
         key=lambda u: (0 if _is_hls_manifest(u) else (2 if _is_short_segment(u) else 1)),
     )
 
-    best, best_d, best_err = None, 0.0, 1e9
+    best, best_d, best_hdrs, best_err = None, 0.0, [], 1e9
     for u in ordered:
-        d = _probe_duration(u, header_args)
+        hdr_args = _build_ffmpeg_headers(u, referer, cookie, user_agent)
+        d = _probe_duration(u, hdr_args, referer=referer, user_agent=user_agent)
         print(f"[pick] duration={d} exact={exact} url={u[:110]}", flush=True)
         if d is None:
             continue
@@ -105,17 +189,22 @@ def pick_url(urls: list[str], duration: float, header_args: list[str], exact: bo
         if duration > 25.0 and 0 < d < 15.0 and _is_short_segment(u):
             print(f"[pick] skipping short .ts/.m4s segment ({d:.1f}s vs expected {duration:.1f}s)", flush=True)
             continue
+        if _is_hls_manifest(u):
+            resolved_dur = d if d > 0 else (duration if duration > 0 else 3600.0)
+            return u, resolved_dur, hdr_args
         if exact and (duration <= 0 or d == 0.0 or abs(d - duration) <= max(5.0, duration * 0.15)):
-            return u, (d if d > 0 else duration)
+            return u, (d if d > 0 else duration), hdr_args
         err = abs(d - duration) if (duration > 0 and d > 0) else 0.0
         if err < best_err:
-            best, best_d, best_err = u, (d if d > 0 else duration), err
+            best, best_d, best_hdrs, best_err = u, (d if d > 0 else duration), hdr_args, err
         if duration > 0 and d > 0 and err < 1.0:
             break
 
     if best is None:
-        raise RuntimeError("No reachable media stream with audio found (check if site uses DRM or only exposed a .ts segment)")
-    return best, best_d
+        raise RuntimeError(
+            "No reachable media stream with audio found (check if site uses DRM or only exposed a .ts segment)"
+        )
+    return best, best_d, best_hdrs
 
 
 class Job:
@@ -196,13 +285,13 @@ def run_job(job: Job) -> None:
 
         work = S.workspace / "live" / job.id
         work.mkdir(parents=True, exist_ok=True)
-        header_args = _build_ffmpeg_headers(job.referer, job.cookie, job.user_agent)
 
         is_youtube = any("youtube.com" in u or "youtu.be" in u for u in job.urls) or (
             "youtube.com" in (job.referer or "")
         )
         a16 = None
         stream_url = None
+        header_args: list[str] = []
 
         if is_youtube:
             yt_url = next((u for u in job.urls if "youtube.com" in u or "youtu.be" in u), job.urls[0])
@@ -240,14 +329,16 @@ def run_job(job: Job) -> None:
             a16 = decode(src_audio, 16000, 1)
             job.duration = len(a16) / 16000
         else:
-            picked_url, probed_dur = pick_url(job.urls, job.expected, header_args, job.exact)
+            picked_url, probed_dur, header_args = pick_url(
+                job.urls, job.expected, job.referer, job.cookie, job.user_agent, job.exact
+            )
             job.url = picked_url
             if job.cancel.is_set():
                 job.state = "cancelled"
                 return
 
             # For .m3u8 streams or long videos (> 4 minutes), use windowed streaming so subtitles start in ~1-2 seconds!
-            effective_dur = probed_dur or job.expected
+            effective_dur = probed_dur or job.expected or 3600.0
             if (_is_hls_manifest(picked_url) or effective_dur > 240.0) and effective_dur > 0:
                 print(
                     f"[job {job.id}] Using real-time windowed stream mode for {picked_url[:90]} (duration={effective_dur:.1f}s)",
