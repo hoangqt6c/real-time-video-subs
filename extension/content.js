@@ -1,15 +1,18 @@
 /* Realtime Vietnamese Subtitles (JA->VI) — content script.
  * ONLY runs on websites the user has enabled in the extension popup (stored in chrome.storage.local).
- * Every <video> on an allowed page gets its own "VI · Phụ đề" button. Clicking it processes THAT video only:
- * its URL (.m3u8, .mp4, etc.) goes to the local server, original video audio stays UNMUTED, the video
- * NEVER pauses to wait for translation (it plays continuously and the server catches up to currentTime),
- * and Vietnamese subtitles show in a draggable blurred bar. */
+ * Features:
+ * 1. Extracts Video Code (e.g. MEYD-916), Title, and Plot Summary from the page (missav, etc.) for 18+ context.
+ * 2. Caches translated subtitles by timestamp & Video Code in localStorage (`rtsubs_subcache_<CODE>`) AND syncs
+ *    with the server's disk cache (`workspace/cache/<CODE>.json`), so reopening a video loads existing subtitles
+ *    instantly without re-running Whisper and only translates remaining untranslated parts.
+ * 3. Original video audio stays UNMUTED and the video NEVER pauses to wait for translation. */
 (() => {
   if (window.__rtDub) return;
   window.__rtDub = true;
 
   const SERVER = "http://127.0.0.1:8765";
   const LS_BAR = "rtdub.bar";
+  const LS_SUB_PREFIX = "rtsubs_subcache_";
   const STORAGE_KEY = "rtdub_allowed_domains";
   const TICK_MS = 80;
   const MIN_VIDEO_W = 150;
@@ -60,7 +63,6 @@
       }
     });
   } else {
-    // Fallback when loaded directly via <script> in extension/test/index.html
     siteEnabled = true;
   }
 
@@ -141,7 +143,7 @@
       .rtdub-status {
         position: fixed;
         z-index: 2147483647;
-        max-width: 340px;
+        max-width: 380px;
         padding: 5px 14px;
         border-radius: 20px;
         background: rgba(15, 23, 42, 0.85);
@@ -239,6 +241,96 @@
   };
   document.addEventListener("fullscreenchange", mount);
 
+  // ---------- page context scraper (Video Code, Title, Summary & Cast on missav / JAV sites) ----------
+  const CODE_REGEX = /\b(FC2-PPV-\d{5,8}|[A-Z]{2,6}-\d{2,6})\b/i;
+
+  function extractPageContext() {
+    const h1 = document.querySelector("h1.text-nord6, h1");
+    const pageTitle = (h1 ? h1.innerText : document.title || "").replace(/\s+/g, " ").trim();
+
+    let videoCode = "";
+    for (const source of [pageTitle, document.title || "", decodeURIComponent(location.pathname || "")]) {
+      const m = source.match(CODE_REGEX);
+      if (m) {
+        videoCode = m[1].toUpperCase();
+        break;
+      }
+    }
+    if (!videoCode) {
+      const slug = (location.pathname || "").split("/").filter(Boolean).pop() || location.hostname;
+      videoCode = slug.replace(/[^A-Za-z0-9_-]+/g, "_").slice(0, 48).toUpperCase();
+    }
+
+    const summaryParts = [];
+    const seenText = new Set();
+    const addPart = (txt) => {
+      const clean = (txt || "").replace(/\s+/g, " ").trim();
+      if (clean && clean.length >= 10 && !seenText.has(clean)) {
+        seenText.add(clean);
+        summaryParts.push(clean);
+      }
+    };
+
+    // 1. missav plot summary box: div.mb-1.text-secondary.break-all (and expanded line-clamp-none)
+    for (const sel of [
+      "div.mb-1.text-secondary.break-all",
+      "div.text-secondary.break-all",
+      "div.mb-4 div.text-secondary",
+      "[class*='synopsis']",
+      "[class*='video-description']",
+      ".description",
+    ]) {
+      for (const el of document.querySelectorAll(sel)) {
+        addPart(el.textContent || el.innerText || "");
+      }
+    }
+
+    // 2. missav cast / tags / genre rows inside details section
+    for (const row of document.querySelectorAll("div.space-y-2 > div.text-secondary")) {
+      const t = (row.innerText || "").replace(/\s+/g, " ").trim();
+      if (t && t.length < 300) addPart(t);
+    }
+
+    // 3. Meta description fallback
+    const metaDesc =
+      document.querySelector('meta[property="og:description"]')?.getAttribute("content") ||
+      document.querySelector('meta[name="description"]')?.getAttribute("content") ||
+      "";
+    if (metaDesc) addPart(metaDesc);
+
+    const pageSummary = summaryParts.join("\n").slice(0, 2500);
+    return { videoCode, pageTitle, pageSummary };
+  }
+
+  // ---------- browser localStorage subtitle cache by Video Code ----------
+  function loadLocalSubCache(videoCode) {
+    if (!videoCode) return null;
+    try {
+      const raw = localStorage.getItem(LS_SUB_PREFIX + videoCode);
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      if (!data || !Array.isArray(data.subs)) return null;
+      return data;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function saveLocalSubCache(videoCode, info, readySet) {
+    if (!videoCode || !info || !Array.isArray(info.subs)) return;
+    try {
+      const payload = {
+        videoCode,
+        duration: info.duration || 0,
+        chunks: info.chunks || [],
+        doneChunks: Array.from(readySet || []),
+        subs: info.subs,
+        updatedAt: Date.now(),
+      };
+      localStorage.setItem(LS_SUB_PREFIX + videoCode, JSON.stringify(payload));
+    } catch (_) {}
+  }
+
   // ---------- geometry helpers ----------
   function contentBox(v) {
     const r = v.getBoundingClientRect();
@@ -285,7 +377,7 @@
 
   const BTN_IDLE_HTML = `<span style="margin-right:5px;font-size:14px;">🇻🇳</span><span>VI · Phụ đề</span>`;
   function activeLabel(s) {
-    const n = s.info?.chunks.length;
+    const n = s.info?.chunks?.length;
     const progress = n ? ` ${s.ready.size}/${n}` : "…";
     return `<span class="rtdub-pulse"></span><span>Phụ đề VI${progress}</span><span style="margin-left:7px;opacity:0.85;font-size:11px;">✕</span>`;
   }
@@ -474,10 +566,10 @@
     frame.style.left = l + "px"; frame.style.top = t + "px";
     frame.style.width = w + "px"; frame.style.height = h + "px";
     const info = act.info;
-    const key = info ? act.ready.size + "/" + info.chunks.length : "";
+    const key = info && info.chunks ? act.ready.size + "/" + info.chunks.length : "";
     if (key !== act.stripKey) {
       act.stripKey = key;
-      if (!info || !info.duration) { strip.style.background = "rgba(255,255,255,.25)"; return; }
+      if (!info || !info.duration || !info.chunks) { strip.style.background = "rgba(255,255,255,.25)"; return; }
       const stops = info.chunks.map((c) => {
         const a = (c.start / info.duration) * 100, b = (c.end / info.duration) * 100;
         const col = act.ready.has(c.i) ? "#10b981" : "rgba(255,255,255,.25)";
@@ -554,7 +646,7 @@
   }, { passive: false });
 
   function renderSub() {
-    if (!siteEnabled || !act || !act.info) { bar.style.display = "none"; return; }
+    if (!siteEnabled || !act || !act.info || !Array.isArray(act.info.subs)) { bar.style.display = "none"; return; }
     const t = act.video.currentTime;
     const sub = act.info.subs.find((s) => t >= s.start - 0.1 && t <= s.end + 0.45);
     if (sub) {
@@ -668,7 +760,7 @@
       const subEntries = Object.entries(intercepted);
       if (subEntries.length > 0) {
         const viEntry = subEntries.find(([url]) => /vi[-_]?(vn)?\.(vtt|srt)/i.test(url) || /vietnamese/i.test(url));
-        const [chosenUrl, chosenText] = viEntry || subEntries[0];
+        const [, chosenText] = viEntry || subEntries[0];
         const cues = parseVtt(chosenText);
         if (cues.length > 0) {
           const lang = viEntry ? "vi" : "auto";
@@ -733,9 +825,16 @@
   function start(v) {
     if (!siteEnabled) return;
     if (act) stop(act);
+    const ctx = extractPageContext();
+    const localCache = loadLocalSubCache(ctx.videoCode);
+
     const s = {
       video: v,
       srcKey: sourceOf(v),
+      videoCode: ctx.videoCode,
+      pageTitle: ctx.pageTitle,
+      pageSummary: ctx.pageSummary,
+      localCache,
       jobId: null,
       creating: false,
       info: null,
@@ -747,19 +846,49 @@
       offScreenSince: 0,
       startedAt: performance.now(),
     };
+
+    // Immediately restore any cached subtitles from localStorage so already-translated timestamps show at 0ms!
+    if (localCache && Array.isArray(localCache.subs) && localCache.subs.length > 0) {
+      s.ready = new Set(localCache.doneChunks || []);
+      s.info = {
+        state: "running",
+        error: "",
+        duration: localCache.duration || (isFinite(v.duration) ? v.duration : 0),
+        chunks: localCache.chunks || [],
+        subs: localCache.subs,
+      };
+      console.log(
+        `[rtdub] Restored ${localCache.subs.length} cached subtitles (${s.ready.size} chunks) from localStorage for ${ctx.videoCode}`
+      );
+      // If all chunks are already translated in localStorage, we don't even need Whisper or server!
+      if (s.info.chunks.length > 0 && s.ready.size >= s.info.chunks.length) {
+        s.info.state = "done";
+        act = s;
+        lastVideo = v;
+        setStatus(`Đã tải 100% phụ đề đã lưu cho ${ctx.videoCode}`, 3000);
+        syncButtons();
+        return;
+      }
+      setStatus(`Đã tải ${localCache.subs.length} câu phụ đề đã lưu cho ${ctx.videoCode} · Đang dịch tiếp phần còn lại…`);
+    } else {
+      setStatus(`Đang khởi tạo dịch phụ đề ${ctx.videoCode ? "(" + ctx.videoCode + ") " : ""}…`);
+    }
+
     s.onSeeking = () => {
       maybeSeek(s, v.currentTime);
     };
     v.addEventListener("seeking", s.onSeeking);
     act = s;
     lastVideo = v;
-    setStatus("Đang khởi tạo dịch phụ đề… (video vẫn phát bình thường)");
     createJob(s);
     syncButtons();
   }
 
   function stop(s, msg = "") {
     if (!s) return;
+    if (s.videoCode && s.info) {
+      saveLocalSubCache(s.videoCode, s.info, s.ready);
+    }
     const jobId = s.jobId;
     const v = s.video;
     try {
@@ -783,7 +912,14 @@
     s.creating = true;
     const { urls, exact } = await mediaCandidates(v);
     if (act !== s) { s.creating = false; return; }
-    console.log("[rtdub] video src:", s.srcKey, "candidates:", urls, "exact:", exact);
+
+    // Refresh page context in case SPA DOM finished rendering title/summary
+    const ctx = extractPageContext();
+    if (ctx.videoCode) s.videoCode = ctx.videoCode;
+    if (ctx.pageTitle) s.pageTitle = ctx.pageTitle;
+    if (ctx.pageSummary) s.pageSummary = ctx.pageSummary;
+
+    console.log("[rtdub] code:", s.videoCode, "candidates:", urls, "summary len:", (s.pageSummary || "").length);
     if (!urls.length) {
       s.creating = false;
       if (act === s) setStatus("Đang tìm luồng âm thanh (.m3u8 / media URL)…");
@@ -809,14 +945,20 @@
           start: startSec,
           transcript: transcriptData ? transcriptData.cues : null,
           transcript_lang: transcriptData ? transcriptData.lang : null,
+          video_code: s.videoCode || null,
+          page_title: s.pageTitle || null,
+          page_summary: s.pageSummary || null,
+          cached_subs: s.localCache ? s.localCache.subs : null,
+          cached_done_chunks: s.localCache ? s.localCache.doneChunks : null,
         }),
       });
       if (!res.ok) throw new Error("HTTP " + res.status);
-      const id = (await res.json()).job_id;
+      const data = await res.json();
       if (act === s) {
-        s.jobId = id;
+        s.jobId = data.job_id;
+        if (data.video_code) s.videoCode = data.video_code;
       } else {
-        cancelServerJob(id);
+        cancelServerJob(data.job_id);
       }
     } catch (e) {
       console.warn("[rtdub] create job failed", e);
@@ -832,7 +974,11 @@
       const info = await (await fetch(`${SERVER}/jobs/${s.jobId}`)).json();
       if (act !== s) return;
       s.info = info;
-      s.ready = new Set(info.chunks.filter((c) => c.ready).map((c) => c.i));
+      if (info.video_code) s.videoCode = info.video_code;
+      s.ready = new Set((info.chunks || []).filter((c) => c.ready).map((c) => c.i));
+      if (s.videoCode && info.subs && info.subs.length > 0) {
+        saveLocalSubCache(s.videoCode, info, s.ready);
+      }
     } catch (_) {
       if (act === s) setStatus("Không kết nối được server local (127.0.0.1:8765)");
     }
@@ -849,7 +995,7 @@
     }
   }
 
-  const chunkAt = (s, t) => s.info?.chunks.find((c) => t >= c.start && t < c.end) || null;
+  const chunkAt = (s, t) => s.info?.chunks?.find((c) => t >= c.start && t < c.end) || null;
 
   // ---------- main loop (never pauses or mutes video; catches up automatically) ----------
   function tick() {
@@ -883,8 +1029,11 @@
     layoutFrame();
 
     const now = performance.now();
-    if (!s.jobId && !s.creating && now - s.lastTry > 1500) createJob(s);
-    if (s.jobId && now - s.lastPoll > 600) { s.lastPoll = now; poll(s); }
+    const allDone = s.info && s.info.chunks && s.info.chunks.length > 0 && s.ready.size >= s.info.chunks.length;
+    if (!allDone) {
+      if (!s.jobId && !s.creating && now - s.lastTry > 1500) createJob(s);
+      if (s.jobId && now - s.lastPoll > 600) { s.lastPoll = now; poll(s); }
+    }
     const info = s.info;
     if (!info) return;
     if (info.state === "error") { stop(s, "Lỗi server: " + info.error); return; }
@@ -894,7 +1043,8 @@
     if (!c) return;
 
     if (!s.ready.has(c.i)) {
-      setStatus(`Đang dịch đuổi theo đoạn ${c.i + 1}/${info.chunks.length}…`);
+      const codePrefix = s.videoCode ? `[${s.videoCode}] ` : "";
+      setStatus(`${codePrefix}Đang dịch đuổi theo đoạn ${c.i + 1}/${info.chunks.length}…`);
       if (Math.abs(t - s.lastSeekSent) > 3.0) {
         maybeSeek(s, t);
       }

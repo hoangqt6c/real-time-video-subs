@@ -1,16 +1,23 @@
 """Local HTTP API used by the browser extension for Real-Time Japanese -> Vietnamese Subtitles.
 
-POST /jobs            {urls, duration?, referer?, cookie?, start?} -> {job_id}
-GET  /jobs/{id}       -> status + per-chunk readiness + subtitles
-POST /jobs/{id}/seek  {t} -> prioritize chunks at or right after current video playback time t
+Features:
+- Persistent subtitle & Whisper ASR caching keyed by Video Code (e.g. MEYD-916) in workspace/cache/<CODE>.json
+  plus browser localStorage sync so reopening a video loads existing subtitles immediately without re-running
+  Whisper and only translates the remaining untranslated chunks.
+- Scrapes page title & plot summary from the video page (e.g. missav) for rich 18+ context.
+- Male/Female voice pitch detection so "anh/em/chị" pronouns match the speaker's actual voice.
 """
 from __future__ import annotations
 
+import json
+import re
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 import uuid
+from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -22,12 +29,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from .asr import Seg
 from .chunker import Chunk, plan_chunks, speech_timestamps
 from .config import Settings
 from .pipeline import HLS_INPUT_ARGS, Engine, HlsPlaylist, VideoSession, decode
 from .translate import Translator
 
 S = Settings()
+CACHE_DIR = S.workspace / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+_cache_io_lock = threading.Lock()
+
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -37,6 +49,95 @@ async def private_network(request, call_next):  # Chrome/Edge Private Network Ac
     response = await call_next(request)
     response.headers["Access-Control-Allow-Private-Network"] = "true"
     return response
+
+
+_CODE_RE = re.compile(r"\b(FC2-PPV-\d{5,8}|[A-Z]{2,6}-\d{2,6})\b", re.IGNORECASE)
+
+
+def _extract_or_sanitize_code(video_code: str | None, page_title: str | None, referer: str | None) -> str:
+    """Extract canonical movie code like MEYD-916 or STARS-359 from code, title, or URL."""
+    for candidate in (video_code or "", page_title or "", referer or ""):
+        m = _CODE_RE.search(candidate)
+        if m:
+            return m.group(1).upper()
+    if video_code and video_code.strip():
+        clean = re.sub(r"[^A-Za-z0-9_-]+", "_", video_code.strip())[:64].strip("_")
+        if clean:
+            return clean.upper()
+    if referer:
+        try:
+            p = urllib.parse.urlparse(referer)
+            slug = p.path.rstrip("/").split("/")[-1]
+            clean = re.sub(r"[^A-Za-z0-9_-]+", "_", slug)[:64].strip("_")
+            if clean:
+                return clean.upper()
+        except Exception:
+            pass
+    return ""
+
+
+def _cache_file(code: str) -> Path | None:
+    if not code:
+        return None
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", code)[:80]
+    return CACHE_DIR / f"{safe}.json"
+
+
+def _load_video_cache(code: str) -> dict:
+    path = _cache_file(code)
+    if not path or not path.is_file():
+        return {}
+    with _cache_io_lock:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[Cache] Warning: could not read {path.name}: {e}", flush=True)
+            return {}
+
+
+def _save_video_cache(job: Job) -> None:
+    if not job.video_code:
+        return
+    path = _cache_file(job.video_code)
+    if not path:
+        return
+    with job.lock:
+        done_list = sorted(job.done_chunks)
+        subs_dict = {str(k): v for k, v in sorted(job.subs.items())}
+        asr_dict: dict[str, list[dict]] = {}
+        if job.session:
+            for idx, seg_list in job.session._segs.items():
+                asr_dict[str(idx)] = [
+                    {
+                        "start": round(g.start, 2),
+                        "end": round(g.end, 2),
+                        "zh": g.zh,
+                        "vi": g.vi,
+                        "gender": g.gender,
+                        "f0": g.f0,
+                    }
+                    for g in seg_list
+                ]
+        bible = job.session.tr.bible if (job.session and job.session.tr) else {}
+
+    payload = {
+        "video_code": job.video_code,
+        "page_title": job.page_title,
+        "page_summary": job.page_summary,
+        "duration": round(job.duration, 2),
+        "updated_at": int(time.time()),
+        "done_chunks": done_list,
+        "subs": subs_dict,
+        "asr_segs": asr_dict,
+        "bible": bible,
+    }
+    with _cache_io_lock:
+        try:
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as e:
+            print(f"[Cache] Warning: failed saving {path.name}: {e}", flush=True)
 
 
 def _same_domain(url_a: str | None, url_b: str | None) -> bool:
@@ -78,7 +179,6 @@ def _build_http_headers(
         origin = _origin_of(referer)
         if origin:
             headers["Origin"] = origin
-    # Only send cookies if target_url is on the same domain as the page (sending missav.ws cookies to surrit.com triggers Cloudflare 403)
     if cookie and _same_domain(target_url, referer):
         headers["Cookie"] = cookie
     return headers
@@ -142,9 +242,7 @@ def pick_url(
     user_agent: str | None,
     exact: bool = False,
 ) -> tuple[str, float, list[str], HlsPlaylist | None]:
-    """Select the best media URL.
-    For .m3u8 HLS playlists, builds an HlsPlaylist in Python so segments (even disguised as .jpeg/.png)
-    are downloaded directly in Python and piped to FFmpeg."""
+    """Select the best media URL."""
     ordered = sorted(
         urls,
         key=lambda u: (
@@ -202,6 +300,11 @@ class Job:
         start: float = 0.0,
         transcript: list[dict] | None = None,
         transcript_lang: str | None = None,
+        video_code: str | None = None,
+        page_title: str | None = None,
+        page_summary: str | None = None,
+        cached_subs: list[dict] | None = None,
+        cached_done_chunks: list[int] | None = None,
     ):
         self.id = uuid.uuid4().hex[:8]
         self.urls = urls
@@ -222,6 +325,11 @@ class Job:
         self.initial_start = start
         self.transcript = transcript
         self.transcript_lang = transcript_lang
+        self.video_code = _extract_or_sanitize_code(video_code, page_title, referer)
+        self.page_title = (page_title or "").strip()
+        self.page_summary = (page_summary or "").strip()
+        self.client_cached_subs = cached_subs or []
+        self.client_cached_done_chunks = cached_done_chunks or []
         self.session: VideoSession | None = None
         self.cancel = threading.Event()
         self.lock = threading.Lock()
@@ -247,7 +355,7 @@ def _engine() -> Engine:
 
 
 def _uniform_chunks(duration: float, s: Settings) -> list[Chunk]:
-    """Create clean ~10s chunks immediately when streaming a long .m3u8 so chunk 0 starts without waiting to download the whole movie."""
+    """Create clean ~10s chunks immediately when streaming a long .m3u8."""
     chunks: list[Chunk] = []
     start = 0.0
     step = s.chunk_target_sec
@@ -260,11 +368,125 @@ def _uniform_chunks(duration: float, s: Settings) -> list[Chunk]:
     return chunks
 
 
+def _restore_cache_into_job(job: Job) -> tuple[dict[int, list[Seg]], dict]:
+    """Restore saved subtitles and Whisper ASR segments from disk cache (workspace/cache/<CODE>.json)
+    and browser localStorage cache so already-translated parts load immediately without Whisper or OpenRouter."""
+    cached_segs: dict[int, list[Seg]] = {}
+    saved_bible: dict = {}
+
+    disk_data = _load_video_cache(job.video_code) if job.video_code else {}
+    if disk_data:
+        if not job.page_title and disk_data.get("page_title"):
+            job.page_title = disk_data["page_title"]
+        if not job.page_summary and disk_data.get("page_summary"):
+            job.page_summary = disk_data["page_summary"]
+        if isinstance(disk_data.get("bible"), dict):
+            saved_bible = disk_data["bible"]
+
+        # Restore Whisper ASR segments (including look-ahead segments not yet translated)
+        raw_asr = disk_data.get("asr_segs") or {}
+        for k_str, seg_list in raw_asr.items():
+            try:
+                c_idx = int(k_str)
+                if 0 <= c_idx < len(job.chunks):
+                    cached_segs[c_idx] = [
+                        Seg(
+                            start=float(g["start"]),
+                            end=float(g["end"]),
+                            zh=str(g.get("zh", "")),
+                            vi=str(g.get("vi", "")),
+                            gender=str(g.get("gender", "unknown")),
+                            f0=int(g.get("f0", 0)),
+                        )
+                        for g in seg_list
+                    ]
+            except Exception:
+                pass
+
+        # Restore completed Vietnamese subtitle chunks
+        raw_subs = disk_data.get("subs") or {}
+        for k_str, sub_list in raw_subs.items():
+            try:
+                c_idx = int(k_str)
+                if 0 <= c_idx < len(job.chunks):
+                    job.subs[c_idx] = sub_list
+                    if c_idx not in cached_segs:
+                        cached_segs[c_idx] = [
+                            Seg(
+                                start=float(s["start"]),
+                                end=float(s["end"]),
+                                zh=str(s.get("zh", "")),
+                                vi=str(s.get("vi", "")),
+                                gender=str(s.get("gender", "unknown")),
+                            )
+                            for s in sub_list
+                        ]
+            except Exception:
+                pass
+
+        for c_idx in disk_data.get("done_chunks") or []:
+            if isinstance(c_idx, int) and 0 <= c_idx < len(job.chunks):
+                job.done_chunks.add(c_idx)
+                job.subs.setdefault(c_idx, [])
+                cached_segs.setdefault(c_idx, [])
+
+    # Also merge any browser localStorage cached subtitles sent by the client
+    if job.client_cached_done_chunks:
+        for c_idx in job.client_cached_done_chunks:
+            if isinstance(c_idx, int) and 0 <= c_idx < len(job.chunks):
+                job.done_chunks.add(c_idx)
+                job.subs.setdefault(c_idx, [])
+                cached_segs.setdefault(c_idx, [])
+
+    if job.client_cached_subs:
+        for s in job.client_cached_subs:
+            try:
+                start = float(s.get("start", 0.0))
+                end = float(s.get("end", start + 1.5))
+                vi = str(s.get("vi", "")).strip()
+                zh = str(s.get("zh", vi)).strip()
+                gender = str(s.get("gender", "unknown"))
+                if not vi:
+                    continue
+                mid = (start + end) / 2.0
+                target = next((c.index for c in job.chunks if c.start <= mid < c.end), None)
+                if target is not None:
+                    existing = job.subs.setdefault(target, [])
+                    if not any(abs(float(x.get("start", -99)) - start) < 0.08 for x in existing):
+                        existing.append({"start": round(start, 2), "end": round(end, 2), "zh": zh, "vi": vi, "gender": gender})
+                    seg_list = cached_segs.setdefault(target, [])
+                    if not any(abs(g.start - start) < 0.08 for g in seg_list):
+                        seg_list.append(Seg(start=start, end=end, zh=zh, vi=vi, gender=gender))
+                    job.done_chunks.add(target)
+            except Exception:
+                pass
+
+    total_restored_subs = sum(len(v) for v in job.subs.values())
+    if job.done_chunks or cached_segs:
+        print(
+            f"[Cache] Video '{job.video_code}': Restored {len(job.done_chunks)}/{len(job.chunks)} finished chunks "
+            f"({total_restored_subs} Vietnamese subtitles) + {len(cached_segs)} Whisper ASR chunks from cache! "
+            f"Skipping Whisper for cached chunks.",
+            flush=True,
+        )
+    return cached_segs, saved_bible
+
+
 def run_job(job: Job) -> None:
     try:
         if job.cancel.is_set():
             job.state = "cancelled"
             return
+
+        if job.video_code or job.page_title or job.page_summary:
+            print("------------------------------------------------------------", flush=True)
+            if job.video_code:
+                print(f"[Context] Video Code : {job.video_code}", flush=True)
+            if job.page_title:
+                print(f"[Context] Page Title : {job.page_title[:120]}", flush=True)
+            if job.page_summary:
+                print(f"[Context] Plot Summary ({len(job.page_summary)} chars): {job.page_summary[:220]}...", flush=True)
+            print("------------------------------------------------------------", flush=True)
 
         work = S.workspace / "live" / job.id
         work.mkdir(parents=True, exist_ok=True)
@@ -366,6 +588,17 @@ def run_job(job: Job) -> None:
                     job.pointer = c.index
                     break
 
+        # Restore any previously saved subtitles & ASR segments for this video code (e.g. MEYD-916)
+        cached_segs, saved_bible = _restore_cache_into_job(job)
+
+        if len(job.done_chunks) >= len(job.chunks) and len(job.chunks) > 0:
+            job.state = "done"
+            print(
+                f"[Cache] All {len(job.chunks)}/{len(job.chunks)} chunks for '{job.video_code}' are already translated in cache! Ready immediately.",
+                flush=True,
+            )
+            return
+
         if job.cancel.is_set():
             job.state = "cancelled"
             return
@@ -374,7 +607,14 @@ def run_job(job: Job) -> None:
             if job.cancel.is_set():
                 job.state = "cancelled"
                 return
-            eng, tr = _engine(), Translator(S)
+            eng = _engine()
+            tr = Translator(
+                S,
+                video_code=job.video_code,
+                page_title=job.page_title,
+                page_summary=job.page_summary,
+                initial_bible=saved_bible,
+            )
 
         session = VideoSession(
             eng,
@@ -386,15 +626,26 @@ def run_job(job: Job) -> None:
             stream_url=stream_url,
             stream_args=header_args,
             hls_playlist=hls_playlist,
+            cached_segs=cached_segs,
+            on_asr_chunk=lambda _idx, _slist: _save_video_cache(job),
         )
         job.session = session
         job.state = "running"
 
-        with gpu_lock:
-            if job.cancel.is_set():
-                job.state = "cancelled"
-                return
-            session.warm_up(start_index=job.pointer)
+        # Seed translator history with any cached subtitles right before job.pointer so pronouns stay consistent
+        for prev_i in sorted(job.subs):
+            if prev_i < job.pointer:
+                for sub_item in job.subs[prev_i]:
+                    spk = "Nam" if sub_item.get("gender") == "male" else "Nữ"
+                    tr.history.append((sub_item.get("zh", ""), sub_item.get("vi", ""), spk))
+
+        first_todo = job.next_chunk()
+        if first_todo is not None:
+            with gpu_lock:
+                if job.cancel.is_set():
+                    job.state = "cancelled"
+                    return
+                session.warm_up(start_index=first_todo)
 
         while not job.cancel.is_set():
             i = job.next_chunk()
@@ -411,16 +662,19 @@ def run_job(job: Job) -> None:
                 job.done_chunks.add(i)
                 job.subs[i] = subs
                 job.timing[i] = timing
+            _save_video_cache(job)
             dur = max(0.1, c.end - c.start)
             print(
                 f"[job {job.id}] DONE chunk {i}/{len(job.chunks)} ({c.start:.1f}s-{c.end:.1f}s) -> "
-                f"{len(subs)} Vietnamese sub(s) ready | timing={timing} RTF={timing.get('total', 0.0) / dur:.2f}\n"
+                f"{len(subs)} Vietnamese sub(s) ready (saved to cache '{job.video_code or 'session'}') | "
+                f"timing={timing} RTF={timing.get('total', 0.0) / dur:.2f}\n"
                 f"------------------------------------------------------------",
                 flush=True,
             )
 
         session.cancel.set()
         job.state = "cancelled" if job.cancel.is_set() else "done"
+        _save_video_cache(job)
         print(f"[job {job.id}] finished with state: {job.state}", flush=True)
     except Exception as exc:
         if job.cancel.is_set():
@@ -444,6 +698,11 @@ class NewJob(BaseModel):
     start: float = 0.0
     transcript: list[dict] | None = None
     transcript_lang: str | None = None
+    video_code: str | None = None
+    page_title: str | None = None
+    page_summary: str | None = None
+    cached_subs: list[dict] | None = None
+    cached_done_chunks: list[int] | None = None
 
 
 class Seek(BaseModel):
@@ -468,10 +727,15 @@ def create_job(req: NewJob):
         start=req.start,
         transcript=req.transcript,
         transcript_lang=req.transcript_lang,
+        video_code=req.video_code,
+        page_title=req.page_title,
+        page_summary=req.page_summary,
+        cached_subs=req.cached_subs,
+        cached_done_chunks=req.cached_done_chunks,
     )
     jobs[job.id] = current = job
     threading.Thread(target=run_job, args=(job,), daemon=True).start()
-    return {"job_id": job.id}
+    return {"job_id": job.id, "video_code": job.video_code}
 
 
 @app.post("/jobs/{job_id}/stop")
@@ -484,7 +748,8 @@ def stop_job(job_id: str):
     if j.session:
         j.session.cancel.set()
     j.state = "cancelled"
-    print(f"[server] Job {job_id} cancelled by client stop request", flush=True)
+    _save_video_cache(j)
+    print(f"[server] Job {job_id} cancelled by client stop request (progress saved to cache)", flush=True)
     return {"ok": True, "job_id": job_id, "state": "cancelled"}
 
 
@@ -497,6 +762,7 @@ def stop_all_jobs():
             if j.session:
                 j.session.cancel.set()
             j.state = "cancelled"
+            _save_video_cache(j)
             count += 1
     print(f"[server] Cancelled {count} active jobs", flush=True)
     return {"ok": True, "cancelled": count}
@@ -515,6 +781,7 @@ def status(job_id: str):
         return {
             "state": j.state,
             "error": j.error,
+            "video_code": j.video_code,
             "duration": j.duration,
             "chunks": [
                 {"i": c.index, "start": c.start, "end": c.end, "ready": c.index in j.done_chunks} for c in j.chunks
@@ -550,6 +817,7 @@ def main() -> None:
     print(f"[Config] Translation API   : {S.base_url}", flush=True)
     print(f"[Config] Translation Model : {S.model}", flush=True)
     print(f"[Config] OpenRouter Key    : {masked_key}", flush=True)
+    print(f"[Config] Subtitle Cache    : {CACHE_DIR}", flush=True)
     print("============================================================", flush=True)
     _engine()  # load Whisper model up front so the first request is fast
     print("[server] Whisper ASR ready (Subtitle-Only mode)", flush=True)

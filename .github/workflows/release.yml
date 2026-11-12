@@ -16,8 +16,10 @@ jobs:
   package-and-release:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout repository with full history
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -36,55 +38,106 @@ jobs:
           node -c extension/page_hook.js
           node -c extension/popup.js
 
+      - name: Compute New Version Tag & Generate Update Log
+        id: meta
+        run: |
+          # Determine previous release tag before creating a new one
+          PREV_TAG=$(git tag -l "v*" --sort=-creatordate | head -n 1 || true)
+
+          # Every push gets a unique version tag (never overwrites old releases!)
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION_TAG="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION_TAG="v1.2.${GITHUB_RUN_NUMBER}"
+            if git rev-parse "${VERSION_TAG}" >/dev/null 2>&1; then
+              SHORT_SHA=$(git rev-parse --short HEAD)
+              VERSION_TAG="v1.2.${GITHUB_RUN_NUMBER}-${SHORT_SHA}"
+            fi
+          fi
+
+          BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+          SHORT_SHA=$(git rev-parse --short HEAD)
+
+          echo "version_tag=${VERSION_TAG}" >> "$GITHUB_OUTPUT"
+          echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+
+          # Build the Release Notes + Update Log markdown file
+          {
+            echo "## 🎬 RT-Subs ${VERSION_TAG} — Real-Time Japanese ➔ Vietnamese 18+ Subtitles"
+            echo "**Build Date:** ${BUILD_DATE} · **Commit:** \`${SHORT_SHA}\`"
+            echo ""
+            echo "### 📝 Update Log (Commits in this Release)"
+            if [ -n "${PREV_TAG}" ] && [ "${PREV_TAG}" != "${VERSION_TAG}" ]; then
+              echo "_Changes since \`${PREV_TAG}\`:_"
+              git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (\`%h\`)" || echo "- Latest update (${SHORT_SHA})"
+              echo ""
+              echo ""
+              echo "**Modified Files:**"
+              git diff --name-status "${PREV_TAG}..HEAD" | sed 's/^/- `/; s/\t/` — `/' | sed 's/$/`/' || true
+            else
+              git log -n 10 --pretty=format:"- %s (\`%h\`)" || echo "- Initial versioned release (${SHORT_SHA})"
+            fi
+            echo ""
+            echo ""
+            if [ -f CHANGELOG.md ]; then
+              echo "---"
+              cat CHANGELOG.md
+              echo ""
+            fi
+            echo "---"
+            echo "### 📦 Ready-to-Run Downloads (Windows 10 PC)"
+            echo "1. **\`rtsubs-windows10-ready-${VERSION_TAG}.zip\`** *(or \`rtsubs-windows10-ready.zip\`)* — **Full Windows 10 Bundle**:"
+            echo "   - Extract anywhere on your Windows 10 PC."
+            echo "   - Load the \`extension\` folder in Chrome/Edge (\`chrome://extensions\` -> **Developer mode** -> **Load unpacked**)."
+            echo "   - Click the **RT-Subs** icon in your browser toolbar to enable your video site (e.g. \`missav.ws\`)."
+            echo "   - Double-click **\`run_server.bat\`** to launch the local Whisper + OpenRouter server."
+            echo "2. **\`rtsubs-extension-${VERSION_TAG}.zip\`** *(or \`rtsubs-extension.zip\`)* — **Standalone Browser Extension**."
+          } > release_notes.md
+
       - name: Build Ready-to-Run ZIP Packages
         run: |
+          VERSION_TAG="${{ steps.meta.outputs.version_tag }}"
           mkdir -p dist/rtsubs-windows10-ready
 
           # 1. Standalone Chrome/Edge Extension ZIP
           cd extension
           zip -r ../dist/rtsubs-extension.zip manifest.json content.js page_hook.js popup.html popup.js test/
+          cp ../dist/rtsubs-extension.zip "../dist/rtsubs-extension-${VERSION_TAG}.zip"
           cd ..
 
           # 2. Full Windows 10 Ready-to-Run Package (No manual building needed)
           cp -r extension dist/rtsubs-windows10-ready/
           cp -r server dist/rtsubs-windows10-ready/
           find dist/rtsubs-windows10-ready/server -name "__pycache__" -type d -exec rm -rf {} +
-          cp run_server.bat requirements.txt .env.example README.md LICENSE dist/rtsubs-windows10-ready/
+          cp run_server.bat requirements.txt .env.example README.md CHANGELOG.md LICENSE dist/rtsubs-windows10-ready/
 
           cd dist
           zip -r rtsubs-windows10-ready.zip rtsubs-windows10-ready/
+          cp rtsubs-windows10-ready.zip "rtsubs-windows10-ready-${VERSION_TAG}.zip"
           cd ..
 
       - name: Upload Artifacts to GitHub Actions Run
         uses: actions/upload-artifact@v4
         with:
-          name: rtsubs-windows10-packages
+          name: rtsubs-windows10-${{ steps.meta.outputs.version_tag }}
           path: |
+            dist/rtsubs-windows10-ready-${{ steps.meta.outputs.version_tag }}.zip
+            dist/rtsubs-extension-${{ steps.meta.outputs.version_tag }}.zip
             dist/rtsubs-windows10-ready.zip
             dist/rtsubs-extension.zip
           if-no-files-found: error
 
-      - name: Create or Update "latest" GitHub Release
+      - name: Publish New Versioned GitHub Release with Update Log
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: "Latest Ready-to-Run Windows 10 & Extension Package"
-          body: |
-            ## 🎬 Real-Time Japanese ➔ Vietnamese Subtitles (`rtsubs`) — Ready to Download & Run
-
-            No manual building required! Choose from the two pre-packaged downloads below:
-
-            1. **`rtsubs-windows10-ready.zip`** *(Complete Windows 10 Bundle)*:
-               - Extract anywhere on your Windows 10 PC.
-               - Load the `extension` folder in Chrome/Edge (`chrome://extensions` or `edge://extensions` -> Enable **Developer mode** -> **Load unpacked**).
-               - Click the **RT-Subs icon** in your browser toolbar to enable the websites where you want subtitles.
-               - Double-click **`run_server.bat`** (automatically creates `.env`, installs Python dependencies on first run, and launches the local server on `127.0.0.1:8765`).
-
-            2. **`rtsubs-extension.zip`** *(Standalone Browser Extension)*:
-               - Extract and load via **Load unpacked** in Chrome, Edge, or Brave.
+          tag_name: ${{ steps.meta.outputs.version_tag }}
+          name: "RT-Subs ${{ steps.meta.outputs.version_tag }} — Windows 10 + Chrome Extension"
+          body_path: release_notes.md
           draft: false
           prerelease: false
           make_latest: "true"
           files: |
+            dist/rtsubs-windows10-ready-${{ steps.meta.outputs.version_tag }}.zip
+            dist/rtsubs-extension-${{ steps.meta.outputs.version_tag }}.zip
             dist/rtsubs-windows10-ready.zip
             dist/rtsubs-extension.zip

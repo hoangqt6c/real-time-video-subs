@@ -12,6 +12,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -166,7 +167,6 @@ class HlsPlaylist:
                         break
         if not variants:
             return None
-        # Sort by bandwidth ascending and choose the lowest/medium resolution variant for fastest audio download
         variants.sort(key=lambda x: x[0])
         return variants[0][1]
 
@@ -182,7 +182,6 @@ class HlsPlaylist:
             if self.init_map_url and self._init_bytes is None:
                 self._init_bytes = self._fetch_bytes(self.init_map_url)
 
-            # Download the 2-3 segments for this 10s window concurrently
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(hits))) as pool:
                 seg_buffers = list(pool.map(lambda item: self._fetch_bytes(item[2]), hits))
         except Exception as e:
@@ -191,7 +190,6 @@ class HlsPlaylist:
 
         total_kb = sum(len(b) for b in seg_buffers) / 1024.0
 
-        # If playlist uses #EXT-X-KEY (AES-128), write temp .ts files so FFmpeg decrypts without .jpeg extension error
         if self.key_line:
             pcm = self._decode_encrypted_segments(hits, seg_buffers, sr)
         else:
@@ -221,7 +219,6 @@ class HlsPlaylist:
                 return np.zeros(0, dtype=np.float32)
             pcm = np.frombuffer(proc.stdout, dtype=np.float32).copy()
 
-        # Trim PCM to the exact [start, start + duration] window
         first_seg_start = hits[0][0]
         skip_sec = max(0.0, start - first_seg_start)
         skip_samples = int(skip_sec * sr)
@@ -390,6 +387,8 @@ class VideoSession:
         stream_url: str | None = None,
         stream_args: list[str] | None = None,
         hls_playlist: HlsPlaylist | None = None,
+        cached_segs: dict[int, list[Seg]] | None = None,
+        on_asr_chunk: Callable[[int, list[Seg]], None] | None = None,
     ):
         self.eng, self.tr, self.a16, self.chunks = eng, tr, a16, chunks
         self.stream_url = stream_url
@@ -397,8 +396,9 @@ class VideoSession:
         self.hls_playlist = hls_playlist
         self.transcript = transcript
         self.transcript_lang = (transcript_lang or "").lower()
-        self._segs: dict[int, list[Seg]] = {}
-        self._asr_time: dict[int, float] = {}
+        self._segs: dict[int, list[Seg]] = dict(cached_segs) if cached_segs else {}
+        self._asr_time: dict[int, float] = {i: 0.0 for i in self._segs}
+        self.on_asr_chunk = on_asr_chunk
         self.cancel = threading.Event()
         self.play_time = 0.0  # start of the chunk being processed; read-ahead stays within a window of it
         self._ahead: threading.Thread | None = None
@@ -470,10 +470,15 @@ class VideoSession:
                     )
                     self._segs[i] = []
                 self._asr_time[i] = time.time() - t
+                if self.on_asr_chunk is not None:
+                    try:
+                        self.on_asr_chunk(i, self._segs[i])
+                    except Exception:
+                        pass
             return self._segs[i]
 
-    def _lines(self) -> list[tuple[float, str]]:
-        return [(g.start, g.zh) for i in sorted(self._segs) for g in self._segs[i]]
+    def _lines(self) -> list[tuple[float, str, str]]:
+        return [(g.start, g.zh, g.gender) for i in sorted(self._segs) for g in self._segs[i]]
 
     def warm_up(self, start_index: int = 0) -> None:
         """Transcribe initial chunk at playhead, build initial context, then read ahead in background."""
@@ -502,6 +507,8 @@ class VideoSession:
         order = list(range(start_idx, len(self.chunks))) + list(range(0, start_idx))
         for idx in order:
             c = self.chunks[idx]
+            if c.index in self._segs:
+                continue
             while not self.cancel.is_set() and c.start > self.play_time + s.story_lookahead_sec:
                 if self.cancel.wait(0.3):
                     return
@@ -547,10 +554,17 @@ def process_chunk(
         t_tr = time.time() - t
         for g in segs:
             if g.vi.strip():
-                print(f"   [VI {g.start:6.1f}s -> {min(g.end, c.end):6.1f}s] {g.vi}", flush=True)
+                g_tag = "Nam" if g.gender == "male" else "Nữ"
+                print(f"   [VI {g.start:6.1f}s -> {min(g.end, c.end):6.1f}s] [{g_tag}] {g.vi}", flush=True)
 
     subs = [
-        {"start": round(g.start, 2), "end": round(min(g.end, c.end), 2), "zh": g.zh, "vi": g.vi}
+        {
+            "start": round(g.start, 2),
+            "end": round(min(g.end, c.end), 2),
+            "zh": g.zh,
+            "vi": g.vi,
+            "gender": g.gender,
+        }
         for g in segs
         if g.vi.strip()
     ]
