@@ -34,6 +34,7 @@ jobs:
           python3 -m py_compile server/rtsubs/*.py
           node -c extension/content.js
           node -c extension/page_hook.js
+          node -c extension/popup.js
 
       - name: Build Ready-to-Run ZIP Packages
         run: |
@@ -41,7 +42,7 @@ jobs:
 
           # 1. Standalone Chrome/Edge Extension ZIP
           cd extension
-          zip -r ../dist/rtsubs-extension.zip manifest.json content.js page_hook.js test/
+          zip -r ../dist/rtsubs-extension.zip manifest.json content.js page_hook.js popup.html popup.js test/
           cd ..
 
           # 2. Full Windows 10 Ready-to-Run Package (No manual building needed)
@@ -76,6 +77,7 @@ jobs:
             1. **`rtsubs-windows10-ready.zip`** *(Complete Windows 10 Bundle)*:
                - Extract anywhere on your Windows 10 PC.
                - Load the `extension` folder in Chrome/Edge (`chrome://extensions` or `edge://extensions` -> Enable **Developer mode** -> **Load unpacked**).
+               - Click the **RT-Subs icon** in your browser toolbar to enable the websites where you want subtitles.
                - Double-click **`run_server.bat`** (automatically creates `.env`, installs Python dependencies on first run, and launches the local server on `127.0.0.1:8765`).
 
             2. **`rtsubs-extension.zip`** *(Standalone Browser Extension)*:

@@ -1,5 +1,6 @@
 /* Realtime Vietnamese Subtitles (JA->VI) — content script.
- * Every <video> on the page gets its own "VI · Phụ đề" button. Clicking it processes THAT video only:
+ * ONLY runs on websites the user has enabled in the extension popup (stored in chrome.storage.local).
+ * Every <video> on an allowed page gets its own "VI · Phụ đề" button. Clicking it processes THAT video only:
  * its URL (.m3u8, .mp4, etc.) goes to the local server, original video audio stays UNMUTED, the video
  * NEVER pauses to wait for translation (it plays continuously and the server catches up to currentTime),
  * and Vietnamese subtitles show in a draggable blurred bar. */
@@ -9,9 +10,59 @@
 
   const SERVER = "http://127.0.0.1:8765";
   const LS_BAR = "rtdub.bar";
+  const STORAGE_KEY = "rtdub_allowed_domains";
   const TICK_MS = 80;
   const MIN_VIDEO_W = 150;
   const MIN_VISIBLE = 0.4;
+
+  // ---------- site whitelist check (controlled via Extension Popup) ----------
+  let siteEnabled = false;
+
+  function normalizeDomain(input) {
+    if (!input) return "";
+    return String(input).trim().toLowerCase().replace(/^\*\./, "").replace(/^www\./, "");
+  }
+
+  function checkDomainAllowed(domains) {
+    const host = normalizeDomain(location.hostname);
+    if (host === "localhost" || host === "127.0.0.1") return true; // Always allow local test fixture
+    if (!Array.isArray(domains) || domains.length === 0) return false;
+    return domains.some((d) => {
+      const rule = normalizeDomain(d);
+      return rule && (host === rule || host.endsWith("." + rule));
+    });
+  }
+
+  function applySiteAllowedState(allowed) {
+    if (siteEnabled === allowed) return;
+    siteEnabled = allowed;
+    if (!siteEnabled) {
+      if (act) stop(act);
+      for (const [, b] of buttons) b.remove();
+      buttons.clear();
+      bar.style.display = "none";
+      frame.style.display = "none";
+      status.style.display = "none";
+      if (root.parentNode) root.remove();
+    } else {
+      mount();
+      syncButtons();
+    }
+  }
+
+  if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.local) {
+    chrome.storage.local.get({ [STORAGE_KEY]: [] }, (res) => {
+      applySiteAllowedState(checkDomainAllowed(res[STORAGE_KEY]));
+    });
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === "local" && changes[STORAGE_KEY]) {
+        applySiteAllowedState(checkDomainAllowed(changes[STORAGE_KEY].newValue || []));
+      }
+    });
+  } else {
+    // Fallback when loaded directly via <script> in extension/test/index.html
+    siteEnabled = true;
+  }
 
   // ---------- styles injection ----------
   const STYLE_ID = "rtdub-styles";
@@ -182,10 +233,10 @@
   root.append(frame, bar, status);
 
   const mount = () => {
+    if (!siteEnabled) return;
     const host = document.fullscreenElement || document.documentElement;
     if (root.parentNode !== host) host.append(root);
   };
-  mount();
   document.addEventListener("fullscreenchange", mount);
 
   // ---------- geometry helpers ----------
@@ -258,6 +309,7 @@
       }
     });
     v.addEventListener("play", () => {
+      if (!siteEnabled) return;
       if (act && act.video !== v && !isPreviewVideo(v)) {
         if (performance.now() - (act.startedAt || 0) < 2000) return;
         const bRect = v.getBoundingClientRect();
@@ -271,6 +323,7 @@
   }
 
   document.addEventListener("play", (e) => {
+    if (!siteEnabled) return;
     const v = e.target;
     if (v && v.tagName === "VIDEO" && act && act.video !== v && !isPreviewVideo(v)) {
       if (performance.now() - (act.startedAt || 0) < 2000) return;
@@ -338,6 +391,7 @@
   window.addEventListener("beforeunload", () => { if (act) stop(act); });
 
   function syncButtons() {
+    if (!siteEnabled) return;
     mount();
     checkUrlChange();
     for (const v of document.querySelectorAll("video")) {
@@ -446,7 +500,6 @@
     if (status.style.display === "none") return;
     if (act && act.video.isConnected) {
       const { l, t, w } = contentBox(act.video);
-      // Place status subtly near the top center of the video so it never blocks the action
       status.style.left = Math.round(l + w / 2 - status.offsetWidth / 2) + "px";
       status.style.top = Math.round(t + 16) + "px";
       return;
@@ -501,7 +554,7 @@
   }, { passive: false });
 
   function renderSub() {
-    if (!act || !act.info) { bar.style.display = "none"; return; }
+    if (!siteEnabled || !act || !act.info) { bar.style.display = "none"; return; }
     const t = act.video.currentTime;
     const sub = act.info.subs.find((s) => t >= s.start - 0.1 && t <= s.end + 0.45);
     if (sub) {
@@ -656,7 +709,6 @@
     const r = await resolveBlob(blob);
     const hookUrls = r.urls || [];
 
-    // Scan Resource Timing for .m3u8 playlists first, then full media files
     const seen = new Set(hookUrls);
     const manifests = [];
     const others = [];
@@ -679,6 +731,7 @@
   let act = null;
 
   function start(v) {
+    if (!siteEnabled) return;
     if (act) stop(act);
     const s = {
       video: v,
@@ -800,6 +853,7 @@
 
   // ---------- main loop (never pauses or mutes video; catches up automatically) ----------
   function tick() {
+    if (!siteEnabled) return;
     const s = act;
     if (!s) return;
     const v = s.video;
@@ -840,7 +894,6 @@
     if (!c) return;
 
     if (!s.ready.has(c.i)) {
-      // Video keeps playing! Tell server to catch up to current playhead if needed
       setStatus(`Đang dịch đuổi theo đoạn ${c.i + 1}/${info.chunks.length}…`);
       if (Math.abs(t - s.lastSeekSent) > 3.0) {
         maybeSeek(s, t);
@@ -852,5 +905,5 @@
 
   setInterval(syncButtons, 200);
   setInterval(() => { tick(); renderSub(); }, TICK_MS);
-  window.addEventListener("resize", () => { syncButtons(); layoutBar(); });
+  window.addEventListener("resize", () => { if (siteEnabled) { syncButtons(); layoutBar(); } });
 })();

@@ -1,12 +1,19 @@
 {
   "manifest_version": 3,
   "name": "Realtime Vietnamese Subtitles (JA->VI)",
-  "version": "0.2.0",
-  "description": "Dịch phụ đề tiếng Việt realtime cho mọi trang web video (xử lý bởi server local).",
-  "host_permissions": [
-    "http://127.0.0.1:8765/*",
-    "<all_urls>"
+  "version": "0.3.0",
+  "description": "Dịch phụ đề tiếng Việt realtime cho các trang web video bạn chọn (xử lý bởi server local).",
+  "permissions": [
+    "storage",
+    "tabs"
   ],
+  "host_permissions": [
+    "http://127.0.0.1:8765/*"
+  ],
+  "action": {
+    "default_title": "RT-Subs JA->VI (Quản lý trang web)",
+    "default_popup": "popup.html"
+  },
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
