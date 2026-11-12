@@ -1,5 +1,6 @@
-"""Per-chunk JA->VI subtitle translation tuned for natural, sensual, uncensored 18+ dialogue,
-with Male/Female speaker voice tags and page synopsis/summary context.
+"""JA->VI subtitle translation tuned for natural, sensual, uncensored 18+ dialogue,
+with Male/Female speaker voice tags, page synopsis/summary context, and high-capacity
+Mega-Batch translation (up to 50 lines / 150s per OpenRouter call with missing-ID recovery).
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ SYSTEM = """Bạn là dịch giả phụ đề phim người lớn (18+ / NSFW /
 2. TRANSCRIPT: lời thoại gốc của video để nắm bắt bối cảnh, diễn biến cảm xúc và cao trào. KHÔNG dịch phần này.
 3. Yêu cầu dịch, là JSON gồm:
    - previous_lines: vài câu liền trước (gốc + vi + speaker) để nối mạch cảm xúc và xưng hô. KHÔNG dịch lại.
-   - translate: các câu cần dịch theo thứ tự thoại, mỗi câu là {id, speaker, zh, max_chars} trong đó:
+   - translate: danh sách các câu cần dịch theo thứ tự thoại (có thể lên tới 50 câu trong một cảnh 2–3 phút), mỗi câu là {id, speaker, zh, max_chars} trong đó:
      * `speaker`: "Nam" (giọng đàn ông) hoặc "Nữ" (giọng phụ nữ) được phân tích trực tiếp từ tần số âm thanh giọng nói.
      * `zh`: câu tiếng Nhật từ Whisper ASR.
 
@@ -41,7 +42,7 @@ SYSTEM = """Bạn là dịch giả phụ đề phim người lớn (18+ / NSFW /
    - 「気持ちいい」「すごい」 -> (Nữ): "Sướng quá anh ơi…", "Tuyệt quá…" / (Nam): "Sướng thật đấy em à…", "Khít quá em ơi…"
    - 「いく」「イっちゃう」 -> (Nữ): "Em ra…", "Em lên đỉnh mất…" / (Nam): "Anh ra đây…", "Anh bắn vào trong nhé…"
 5. Khắc phục lỗi nghe nhầm của Whisper (ASR): trong cảnh nóng, giọng thì thầm hoặc tiếng thở gấp dễ làm ASR nhận nhầm thành từ đồng âm vô nghĩa. Hãy dựa vào TÓM TẮT PHIM, giới tính `speaker` và mạch cảnh nóng để suy ra câu thoại gợi cảm đúng nghĩa nhất.
-6. Mỗi `id` đúng một bản dịch tương ứng; không gộp, không tách, không bỏ sót `id` nào. Chỉ trả về JSON hợp lệ, không Markdown: {"items":[{"id":0,"vi":"..."}]}
+6. Mỗi `id` trong `translate` PHẢI có đúng một bản dịch tương ứng; không gộp, không tách, KHÔNG BỎ SÓT bất kỳ `id` nào. Chỉ trả về JSON hợp lệ, không Markdown: {"items":[{"id":0,"vi":"..."}]}
 
 # Ví dụ
 translate: [{"id":0,"speaker":"Nữ","zh":"あっ…だめ、そこ気持ちいい…もっと触って…","max_chars":80},{"id":1,"speaker":"Nam","zh":"ほら、もうこんなに濡れてるじゃないか…","max_chars":80}]
@@ -144,7 +145,7 @@ class Translator:
         from openai import OpenAI
 
         self.s = s
-        self.client = OpenAI(base_url=s.base_url, api_key=s.api_key, timeout=60)
+        self.client = OpenAI(base_url=s.base_url, api_key=s.api_key, timeout=90)
         self.history: list[tuple[str, str, str]] = []  # (source, vi, speaker_label)
         self._lock = threading.Lock()
         self.video_code = (video_code or "").strip()
@@ -212,6 +213,9 @@ class Translator:
             )
 
     def translate(self, segs: list[Seg], slots: list[float]) -> None:
+        """Translate a list of segments (from a 15s initial chunk or a 150s Mega-Batch).
+        Automatically processes up to `s.max_lines_per_batch` (default 50) lines per single OpenRouter call
+        with `max_tokens=8192` and retries only missing IDs if a large batch partially completes."""
         if not segs:
             return
         if all(bool(g.vi) for g in segs):
@@ -229,41 +233,66 @@ class Translator:
                 g.vi = g.zh
             return
 
+        cap = max(10, self.s.max_lines_per_batch)
+        if len(segs) > cap:
+            print(
+                f"[Step 3/3 - OpenRouter VI] Mega-Batch has {len(segs)} lines (>{cap} max per call); "
+                f"splitting into {(len(segs) + cap - 1) // cap} sub-batches...",
+                flush=True,
+            )
+            for offset in range(0, len(segs), cap):
+                self._translate_subbatch(segs[offset : offset + cap], slots[offset : offset + cap])
+        else:
+            self._translate_subbatch(segs, slots)
+
+    def _translate_subbatch(self, segs: list[Seg], slots: list[float]) -> None:
         t0 = time.time()
         male_cnt = sum(1 for g in segs if g.gender == "male")
         female_cnt = len(segs) - male_cnt
         print(
             f"[Step 3/3 - OpenRouter VI] Uploading {len(segs)} Japanese line(s) "
-            f"(Nữ={female_cnt}, Nam={male_cnt}) to {self.s.base_url} (model={self.s.model})...",
+            f"(Nữ={female_cnt}, Nam={male_cnt}) to {self.s.base_url} (model={self.s.model}, max_tokens=8192)...",
             flush=True,
         )
-        ctx = self.history[-self.s.context_pairs :]
-        req = {
-            "previous_lines": [{"speaker": spk, "zh": z, "vi": v} for z, v, spk in ctx],
-            "translate": [
-                {
-                    "id": i,
-                    "speaker": "Nam" if g.gender == "male" else "Nữ",
-                    "zh": g.zh,
-                    "max_chars": max(30, int(slots[i] * self.s.chars_per_sec)),
-                }
-                for i, g in enumerate(segs)
-            ],
-        }
+
         with self._lock:
             bible_text, transcript_text = self._bible_text, self._transcript_text
-        messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": bible_text}]
-        if transcript_text:
-            messages.append({"role": "user", "content": transcript_text})
-        messages.append({"role": "user", "content": json.dumps(req, ensure_ascii=False)})
+
         result: dict[int, str] = {}
+        missing_ids = list(range(len(segs)))
+
         for attempt in range(1, 4):
+            ctx = self.history[-self.s.context_pairs :]
+            req = {
+                "previous_lines": [{"speaker": spk, "zh": z, "vi": v} for z, v, spk in ctx],
+                "translate": [
+                    {
+                        "id": idx,
+                        "speaker": "Nam" if segs[idx].gender == "male" else "Nữ",
+                        "zh": segs[idx].zh,
+                        "max_chars": max(30, int(slots[idx] * self.s.chars_per_sec)),
+                    }
+                    for idx in missing_ids
+                ],
+            }
+            messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": bible_text}]
+            if transcript_text:
+                messages.append({"role": "user", "content": transcript_text})
+            messages.append({"role": "user", "content": json.dumps(req, ensure_ascii=False)})
+
             try:
-                r = self.client.chat.completions.create(model=self.s.model, messages=messages, max_tokens=4000)
+                r = self.client.chat.completions.create(model=self.s.model, messages=messages, max_tokens=8192)
                 self._log_usage(r, "OpenRouter")
-                result = _parse(r.choices[0].message.content)
-                if all(i in result for i in range(len(segs))):
+                parsed = _parse(r.choices[0].message.content)
+                result.update(parsed)
+                missing_ids = [i for i in range(len(segs)) if i not in result]
+                if not missing_ids:
                     break
+                print(
+                    f"[Step 3/3 - OpenRouter VI] Received {len(result)}/{len(segs)} lines; "
+                    f"fetching remaining {len(missing_ids)} line(s) (attempt {attempt + 1}/3)...",
+                    flush=True,
+                )
             except Exception as exc:  # network / malformed JSON -> retry
                 print(f"[Step 3/3 - OpenRouter WARNING] Attempt {attempt}/3 failed: {exc}", flush=True)
 

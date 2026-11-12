@@ -36,10 +36,12 @@ class Settings:
     whisper_model: str = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
     whisper_compute: str = os.environ.get("WHISPER_COMPUTE", "int8_float16")
     source_language: str = os.environ.get("SOURCE_LANGUAGE", "ja")
-    chunk_min_sec: float = 6.0
-    chunk_target_sec: float = 10.0
-    chunk_max_sec: float = 14.0
-    chars_per_sec: float = 28.0  # Comfortable subtitle reading budget (no TTS speed constraints)
+    chunk_min_sec: float = 10.0
+    chunk_target_sec: float = float(os.environ.get("FIRST_CHUNK_SECONDS", "15.0"))  # 15s initial chunk on start/seek
+    chunk_max_sec: float = 20.0
+    mega_batch_sec: float = float(os.environ.get("MEGA_BATCH_SECONDS", "150.0"))  # 150s (2.5m) Mega-Batch after first chunk
+    max_lines_per_batch: int = int(os.environ.get("MAX_LINES_PER_BATCH", "50"))  # Max subtitle lines per single OpenRouter call
+    chars_per_sec: float = 28.0  # Comfortable subtitle reading budget
     base_url: str = field(
         default_factory=lambda: os.environ.get("TRANSLATION_BASE_URL", "") or "https://openrouter.ai/api/v1"
     )
@@ -47,7 +49,7 @@ class Settings:
     model: str = field(
         default_factory=lambda: os.environ.get("TRANSLATION_MODEL", "") or "google/gemma-3-27b-it"
     )
-    context_pairs: int = 12
-    story_lookahead_sec: float = 120.0  # background ASR stays up to 2 minutes ahead of playback
-    bible_every: int = 3  # rebuild the story bible after this many newly transcribed chunks
-    transcript_max_chars: int = 20000  # cap on the source transcript placed in the prompt
+    context_pairs: int = 16
+    story_lookahead_sec: float = 300.0  # background ASR stays up to 5 minutes ahead of playback
+    bible_every: int = 6  # rebuild the story bible after this many newly transcribed 15s blocks
+    transcript_max_chars: int = 24000  # cap on the source transcript placed in the prompt

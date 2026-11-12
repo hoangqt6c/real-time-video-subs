@@ -1,4 +1,4 @@
-"""Subtitle-only chunk processing + resident Whisper ASR engine + Python HLS segment streamer."""
+"""Subtitle-only chunk & Mega-Batch processing + resident Whisper ASR engine + Python HLS segment streamer."""
 from __future__ import annotations
 
 import concurrent.futures
@@ -75,7 +75,6 @@ class HlsPlaylist:
             if "#EXTM3U" not in text:
                 return None
 
-            # If this is a Master Playlist (#EXT-X-STREAM-INF), follow a variant media playlist
             if "#EXT-X-STREAM-INF" in text and "#EXTINF:" not in text:
                 variant_url = cls._pick_variant_url(text, final_url)
                 if not variant_url:
@@ -145,14 +144,21 @@ class HlsPlaylist:
         return data.decode("utf-8", errors="ignore"), final_url
 
     def _fetch_bytes(self, url: str) -> bytes:
-        req = urllib.request.Request(url, headers=self.headers)
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            return resp.read()
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(url, headers=self.headers)
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    return resp.read()
+            except Exception as e:
+                last_err = e
+                time.sleep(0.25 * (attempt + 1))
+        raise RuntimeError(f"Segment fetch failed after 3 attempts ({url[:80]}): {last_err}")
 
     @staticmethod
     def _pick_variant_url(master_text: str, base_url: str) -> str | None:
         """Pick a variant stream from a master playlist.
-        Prefers moderate bandwidth (e.g. 480p/720p) so segments download 3x faster while keeping identical audio."""
+        Prefers lowest/moderate bandwidth (e.g. 360p/480p/720p) so 150s Mega-Batches download in ~1s while keeping identical audio."""
         lines = [ln.strip() for ln in master_text.splitlines() if ln.strip()]
         variants: list[tuple[int, str]] = []
         for idx, line in enumerate(lines):
@@ -171,7 +177,8 @@ class HlsPlaylist:
         return variants[0][1]
 
     def decode_window(self, start: float, duration: float, sr: int = 16000) -> np.ndarray:
-        """Download only the 2-3 segments overlapping [start, start+duration] and decode via FFmpeg stdin."""
+        """Download all HLS segments overlapping [start, start+duration] (15s chunk or 150s Mega-Batch)
+        in parallel (up to 8 threads) and decode via FFmpeg stdin."""
         end = start + duration
         hits = [(s0, s1, u) for (s0, s1, u) in self.segments if s1 > start and s0 < end]
         if not hits:
@@ -182,7 +189,8 @@ class HlsPlaylist:
             if self.init_map_url and self._init_bytes is None:
                 self._init_bytes = self._fetch_bytes(self.init_map_url)
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(hits))) as pool:
+            # Use up to 8 concurrent threads so even a 150s Mega-Batch (~25-30 segments) downloads in ~1s
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(hits))) as pool:
                 seg_buffers = list(pool.map(lambda item: self._fetch_bytes(item[2]), hits))
         except Exception as e:
             print(f"[Step 1/3 - Audio ERROR] Failed downloading HLS segments for {start:.1f}s-{end:.1f}s: {e}", flush=True)
@@ -374,7 +382,7 @@ class Engine:
 
 
 class VideoSession:
-    """One video session: transcribes chunks ahead of playback and translates into Vietnamese subtitles."""
+    """One video session: supports both 15s instant playhead chunks and 150s contiguous Mega-Batches."""
 
     def __init__(
         self,
@@ -398,9 +406,10 @@ class VideoSession:
         self.transcript_lang = (transcript_lang or "").lower()
         self._segs: dict[int, list[Seg]] = dict(cached_segs) if cached_segs else {}
         self._asr_time: dict[int, float] = {i: 0.0 for i in self._segs}
+        self._bible_built_at_segs = 0
         self.on_asr_chunk = on_asr_chunk
         self.cancel = threading.Event()
-        self.play_time = 0.0  # start of the chunk being processed; read-ahead stays within a window of it
+        self.play_time = 0.0
         self._ahead: threading.Thread | None = None
 
         if self.transcript:
@@ -443,45 +452,96 @@ class VideoSession:
             flush=True,
         )
 
-    def _chunk_audio(self, c: Chunk) -> np.ndarray:
+    def _range_audio(self, start_sec: float, end_sec: float) -> np.ndarray:
+        """Decode audio for a contiguous time range [start_sec, end_sec] (either 15s or 150s Mega-Batch)."""
+        dur = max(0.1, end_sec - start_sec)
         if self.a16 is not None:
-            s_idx = int(c.start * 16000)
-            e_idx = int(c.end * 16000)
+            s_idx = int(start_sec * 16000)
+            e_idx = int(end_sec * 16000)
             if s_idx < len(self.a16):
                 return self.a16[s_idx:e_idx]
         if self.hls_playlist is not None:
-            return self.hls_playlist.decode_window(c.start, c.end - c.start, 16000)
+            return self.hls_playlist.decode_window(start_sec, dur, 16000)
         if self.stream_url:
-            return decode_window(self.stream_url, c.start, c.end - c.start, 16000, self.stream_args)
+            return decode_window(self.stream_url, start_sec, dur, 16000, self.stream_args)
         return np.zeros(0, dtype=np.float32)
 
     def segs_for(self, i: int) -> list[Seg]:
+        self.segs_for_batch([i])
+        return self._segs.get(i, [])
+
+    def segs_for_batch(self, batch_indices: list[int]) -> list[Seg]:
+        """Ensure all chunk indices in `batch_indices` are transcribed by Whisper.
+        Contiguous untranscribed chunks in `batch_indices` are decoded and transcribed in ONE single pass
+        so 150s Mega-Batches never cut Japanese sentences at 15s boundaries!"""
+        if not batch_indices:
+            return []
         with self.eng.asr_lock:
-            if i not in self._segs:
-                c = self.chunks[i]
-                t = time.time()
-                pcm = self._chunk_audio(c)
-                if len(pcm) > 800:
-                    self._segs[i] = self.eng.asr.transcribe(pcm, c.start)
-                else:
-                    print(
-                        f"[Step 1/3 - Audio WARNING] Chunk {i} ({c.start:.1f}s -> {c.end:.1f}s) returned empty audio!",
-                        flush=True,
-                    )
-                    self._segs[i] = []
-                self._asr_time[i] = time.time() - t
+            missing = [idx for idx in batch_indices if idx not in self._segs]
+            if missing:
+                # Group missing indices into contiguous runs (usually 1 single run like [1..10])
+                runs: list[list[int]] = []
+                for idx in sorted(missing):
+                    if not runs or idx != runs[-1][-1] + 1:
+                        runs.append([idx])
+                    else:
+                        runs[-1].append(idx)
+
+                for run in runs:
+                    if self.cancel.is_set():
+                        break
+                    start_sec = self.chunks[run[0]].start
+                    end_sec = self.chunks[run[-1]].end
+                    t0 = time.time()
+                    pcm = self._range_audio(start_sec, end_sec)
+                    for idx in run:
+                        self._segs[idx] = []
+                    if len(pcm) > 800:
+                        raw_segs = self.eng.asr.transcribe(pcm, start_sec)
+                        for seg in raw_segs:
+                            mid = (seg.start + seg.end) / 2.0
+                            assigned = run[-1]
+                            for idx in run:
+                                c = self.chunks[idx]
+                                if c.start <= mid <= c.end:
+                                    assigned = idx
+                                    break
+                            self._segs[assigned].append(seg)
+                    else:
+                        print(
+                            f"[Step 1/3 - Audio WARNING] Window {start_sec:.1f}s -> {end_sec:.1f}s returned empty audio!",
+                            flush=True,
+                        )
+                    elapsed_per = (time.time() - t0) / max(1, len(run))
+                    for idx in run:
+                        self._asr_time[idx] = elapsed_per
+
                 if self.on_asr_chunk is not None:
                     try:
-                        self.on_asr_chunk(i, self._segs[i])
+                        self.on_asr_chunk(batch_indices[-1], [])
                     except Exception:
                         pass
-            return self._segs[i]
+
+            return [g for idx in batch_indices for g in self._segs.get(idx, [])]
 
     def _lines(self) -> list[tuple[float, str, str]]:
         return [(g.start, g.zh, g.gender) for i in sorted(self._segs) for g in self._segs[i]]
 
+    def maybe_update_bible(self) -> None:
+        done = len(self._segs)
+        all_lines = self._lines()
+        if not all_lines:
+            return
+        if (
+            (self._bible_built_at_segs == 0 and done >= 1)
+            or (done - self._bible_built_at_segs >= self.eng.s.bible_every)
+            or (done == len(self.chunks) and self._bible_built_at_segs < done)
+        ):
+            self._bible_built_at_segs = done
+            self.tr.understand(all_lines, complete=done == len(self.chunks))
+
     def warm_up(self, start_index: int = 0) -> None:
-        """Transcribe initial chunk at playhead, build initial context, then read ahead in background."""
+        """Transcribe initial 15s chunk at playhead immediately."""
         if self.cancel.is_set() or not self.chunks:
             return
         if self.transcript:
@@ -495,82 +555,64 @@ class VideoSession:
         first_idx = max(0, min(start_index, len(self.chunks) - 1))
         self.play_time = self.chunks[first_idx].start
         self.segs_for(first_idx)
-        if self.cancel.is_set():
-            return
-        if len(self.chunks) > 1 and not self.cancel.is_set():
-            self._ahead = threading.Thread(target=self._read_ahead, args=(first_idx,), daemon=True)
-            self._ahead.start()
 
-    def _read_ahead(self, start_idx: int = 0) -> None:
-        s = self.eng.s
-        last_bible = 0
-        order = list(range(start_idx, len(self.chunks))) + list(range(0, start_idx))
-        for idx in order:
+    def process_batch(
+        self, batch_indices: list[int], cancel_event: threading.Event | None = None
+    ) -> tuple[dict[int, list[dict]], dict]:
+        """Process either a single 15s chunk (`len(batch_indices) == 1`) or a 150s Mega-Batch (`len > 1`).
+        Returns (subs_by_chunk_index, timing_dict)."""
+        if not batch_indices:
+            return {}, {}
+        self.play_time = self.chunks[batch_indices[0]].start
+        t_start = time.time()
+        if cancel_event and cancel_event.is_set():
+            return {}, {}
+
+        all_segs = self.segs_for_batch(batch_indices)
+        t_asr = sum(self._asr_time.get(idx, 0.0) for idx in batch_indices)
+
+        # Build / refresh Story Bible if we have enough transcribed context
+        if len(batch_indices) > 1 or self._bible_built_at_segs == 0:
+            self.maybe_update_bible()
+
+        if cancel_event and cancel_event.is_set():
+            return {}, {}
+
+        batch_end = self.chunks[batch_indices[-1]].end
+        slots = [max(1.0, min(g.end, batch_end) - g.start) for g in all_segs]
+        t_tr_start = time.time()
+        if not all_segs or all(bool(g.vi) for g in all_segs):
+            t_tr = 0.0
+        else:
+            self.tr.translate(all_segs, slots)
+            t_tr = time.time() - t_tr_start
+            for g in all_segs:
+                if g.vi.strip():
+                    g_tag = "Nam" if g.gender == "male" else "Nữ"
+                    print(f"   [VI {g.start:6.1f}s -> {min(g.end, batch_end):6.1f}s] [{g_tag}] {g.vi}", flush=True)
+
+        subs_by_chunk: dict[int, list[dict]] = {}
+        for idx in batch_indices:
             c = self.chunks[idx]
-            if c.index in self._segs:
-                continue
-            while not self.cancel.is_set() and c.start > self.play_time + s.story_lookahead_sec:
-                if self.cancel.wait(0.3):
-                    return
-            if self.cancel.is_set():
-                return
-            self.segs_for(c.index)
-            if self.cancel.is_set():
-                return
-            done = len(self._segs)
-            if (done == 2 and last_bible == 0) or (done - last_bible >= s.bible_every) or (done == len(self.chunks)):
-                last_bible = done
-                self.tr.understand(self._lines(), complete=done == len(self.chunks))
+            subs_by_chunk[idx] = [
+                {
+                    "start": round(g.start, 2),
+                    "end": round(min(g.end, batch_end), 2),
+                    "zh": g.zh,
+                    "vi": g.vi,
+                    "gender": g.gender,
+                }
+                for g in self._segs.get(idx, [])
+                if g.vi.strip()
+            ]
+
+        timing = {
+            "asr": round(t_asr, 2),
+            "translate": round(t_tr, 2),
+            "total": round(time.time() - t_start + t_asr, 2),
+        }
+        return subs_by_chunk, timing
 
     def process(self, i: int, cancel_event: threading.Event | None = None) -> tuple[list[dict], dict]:
-        self.play_time = self.chunks[i].start
-        return process_chunk(
-            self.tr,
-            self.chunks[i],
-            self.segs_for(i),
-            self._asr_time.get(i, 0.0),
-            cancel_event=cancel_event,
-        )
-
-
-def process_chunk(
-    tr: Translator,
-    c: Chunk,
-    segs: list[Seg],
-    t_asr: float = 0.0,
-    cancel_event: threading.Event | None = None,
-) -> tuple[list[dict], dict]:
-    """Returns (subtitle dicts for the chunk, timing dict). No TTS or audio mixing."""
-    t_start = time.time()
-    if cancel_event and cancel_event.is_set():
-        return [], {}
-
-    slots = [max(1.0, min(g.end, c.end) - g.start) for g in segs]
-    t = time.time()
-    if not segs or all(bool(g.vi) for g in segs):
-        t_tr = 0.0
-    else:
-        tr.translate(segs, slots)
-        t_tr = time.time() - t
-        for g in segs:
-            if g.vi.strip():
-                g_tag = "Nam" if g.gender == "male" else "Nữ"
-                print(f"   [VI {g.start:6.1f}s -> {min(g.end, c.end):6.1f}s] [{g_tag}] {g.vi}", flush=True)
-
-    subs = [
-        {
-            "start": round(g.start, 2),
-            "end": round(min(g.end, c.end), 2),
-            "zh": g.zh,
-            "vi": g.vi,
-            "gender": g.gender,
-        }
-        for g in segs
-        if g.vi.strip()
-    ]
-    timing = {
-        "asr": round(t_asr, 2),
-        "translate": round(t_tr, 2),
-        "total": round(time.time() - t_start + t_asr, 2),
-    }
-    return subs, timing
+        subs_map, timing = self.process_batch([i], cancel_event=cancel_event)
+        return subs_map.get(i, []), timing

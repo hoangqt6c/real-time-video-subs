@@ -1,9 +1,12 @@
 """Local HTTP API used by the browser extension for Real-Time Japanese -> Vietnamese Subtitles.
 
 Features:
+- Two-Tier Adaptive Chunking:
+  * Tier 1 (Instant Playhead Chunk): 15-second chunk on initial start or seek (~1.5s latency).
+  * Tier 2 (Mega-Batch): 150-second (2.5-minute) contiguous batches thereafter, sending up to 50 lines
+    per single OpenRouter call (`max_tokens=8192`) to cut API requests by 10x-15x.
 - Persistent subtitle & Whisper ASR caching keyed by Video Code (e.g. MEYD-916) in workspace/cache/<CODE>.json
-  plus browser localStorage sync so reopening a video loads existing subtitles immediately without re-running
-  Whisper and only translates the remaining untranslated chunks.
+  plus browser localStorage sync.
 - Scrapes page title & plot summary from the video page (e.g. missav) for rich 18+ context.
 - Male/Female voice pitch detection so "anh/em/chị" pronouns match the speaker's actual voice.
 """
@@ -102,6 +105,11 @@ def _save_video_cache(job: Job) -> None:
     if not path:
         return
     with job.lock:
+        done_rivers = [
+            {"start": round(job.chunks[i].start, 2), "end": round(job.chunks[i].end, 2)}
+            for i in sorted(job.done_chunks)
+            if 0 <= i < len(job.chunks)
+        ]
         done_list = sorted(job.done_chunks)
         subs_dict = {str(k): v for k, v in sorted(job.subs.items())}
         asr_dict: dict[str, list[dict]] = {}
@@ -125,8 +133,10 @@ def _save_video_cache(job: Job) -> None:
         "page_title": job.page_title,
         "page_summary": job.page_summary,
         "duration": round(job.duration, 2),
+        "chunk_target_sec": S.chunk_target_sec,
         "updated_at": int(time.time()),
         "done_chunks": done_list,
+        "done_ranges": done_rivers,
         "subs": subs_dict,
         "asr_segs": asr_dict,
         "bible": bible,
@@ -334,11 +344,33 @@ class Job:
         self.cancel = threading.Event()
         self.lock = threading.Lock()
 
-    def next_chunk(self) -> int | None:
+    def next_batch(self) -> list[int]:
+        """Two-Tier Adaptive Batch Selector:
+        - Tier 1 (Instant 15s Playhead Chunk): If the chunk at `self.pointer` (current playback / seek position)
+          is NOT yet done, return ONLY `[self.pointer]` so the first subtitle appears on screen in ~1.5s!
+        - Tier 2 (150s Mega-Batch): Once `self.pointer` is done, group up to `S.mega_batch_sec` (150s = 10 chunks)
+          of consecutive undone chunks into a single Mega-Batch!"""
         todo = [c.index for c in self.chunks if c.index not in self.done_chunks]
         if not todo:
-            return None
-        return next((i for i in todo if i >= self.pointer), todo[0])
+            return []
+
+        # Tier 1: Playhead chunk is not ready yet -> process single 15s chunk immediately!
+        if self.pointer in todo:
+            return [self.pointer]
+
+        # Tier 2: Playhead chunk is already ready -> build a 150s Mega-Batch of consecutive undone chunks
+        first = next((i for i in todo if i >= self.pointer), todo[0])
+        batch = [first]
+        acc_dur = self.chunks[first].end - self.chunks[first].start
+        cur = first + 1
+        while cur < len(self.chunks) and cur not in self.done_chunks:
+            c_dur = self.chunks[cur].end - self.chunks[cur].start
+            if acc_dur + c_dur > S.mega_batch_sec + 1.0:
+                break
+            batch.append(cur)
+            acc_dur += c_dur
+            cur += 1
+        return batch
 
 
 engine: Engine | None = None
@@ -355,7 +387,7 @@ def _engine() -> Engine:
 
 
 def _uniform_chunks(duration: float, s: Settings) -> list[Chunk]:
-    """Create clean ~10s chunks immediately when streaming a long .m3u8."""
+    """Create clean 15s base chunks so start/seek is 15s while Mega-Batches group 10 chunks (150s) at once."""
     chunks: list[Chunk] = []
     start = 0.0
     step = s.chunk_target_sec
@@ -369,12 +401,14 @@ def _uniform_chunks(duration: float, s: Settings) -> list[Chunk]:
 
 
 def _restore_cache_into_job(job: Job) -> tuple[dict[int, list[Seg]], dict]:
-    """Restore saved subtitles and Whisper ASR segments from disk cache (workspace/cache/<CODE>.json)
-    and browser localStorage cache so already-translated parts load immediately without Whisper or OpenRouter."""
+    """Restore saved subtitles and Whisper ASR segments by timestamp from disk cache (`workspace/cache/<CODE>.json`)
+    and browser `localStorage` cache—even if chunk duration changed from 10s to 15s!"""
     cached_segs: dict[int, list[Seg]] = {}
     saved_bible: dict = {}
 
     disk_data = _load_video_cache(job.video_code) if job.video_code else {}
+    same_grid = abs(float(disk_data.get("chunk_target_sec", S.chunk_target_sec)) - S.chunk_target_sec) < 0.5
+
     if disk_data:
         if not job.page_title and disk_data.get("page_title"):
             job.page_title = disk_data["page_title"]
@@ -383,61 +417,74 @@ def _restore_cache_into_job(job: Job) -> tuple[dict[int, list[Seg]], dict]:
         if isinstance(disk_data.get("bible"), dict):
             saved_bible = disk_data["bible"]
 
-        # Restore Whisper ASR segments (including look-ahead segments not yet translated)
+        # Map all saved ASR segments to the current chunk grid by timestamp midpoint
         raw_asr = disk_data.get("asr_segs") or {}
-        for k_str, seg_list in raw_asr.items():
-            try:
-                c_idx = int(k_str)
-                if 0 <= c_idx < len(job.chunks):
-                    cached_segs[c_idx] = [
-                        Seg(
-                            start=float(g["start"]),
-                            end=float(g["end"]),
-                            zh=str(g.get("zh", "")),
-                            vi=str(g.get("vi", "")),
-                            gender=str(g.get("gender", "unknown")),
-                            f0=int(g.get("f0", 0)),
-                        )
-                        for g in seg_list
-                    ]
-            except Exception:
-                pass
-
-        # Restore completed Vietnamese subtitle chunks
-        raw_subs = disk_data.get("subs") or {}
-        for k_str, sub_list in raw_subs.items():
-            try:
-                c_idx = int(k_str)
-                if 0 <= c_idx < len(job.chunks):
-                    job.subs[c_idx] = sub_list
-                    if c_idx not in cached_segs:
-                        cached_segs[c_idx] = [
-                            Seg(
-                                start=float(s["start"]),
-                                end=float(s["end"]),
-                                zh=str(s.get("zh", "")),
-                                vi=str(s.get("vi", "")),
-                                gender=str(s.get("gender", "unknown")),
+        for _, seg_list in raw_asr.items():
+            for g in seg_list:
+                try:
+                    start = float(g["start"])
+                    end = float(g["end"])
+                    mid = (start + end) / 2.0
+                    target = next((c.index for c in job.chunks if c.start <= mid < c.end), None)
+                    if target is not None:
+                        lst = cached_segs.setdefault(target, [])
+                        if not any(abs(x.start - start) < 0.08 for x in lst):
+                            lst.append(
+                                Seg(
+                                    start=start,
+                                    end=end,
+                                    zh=str(g.get("zh", "")),
+                                    vi=str(g.get("vi", "")),
+                                    gender=str(g.get("gender", "unknown")),
+                                    f0=int(g.get("f0", 0)),
+                                )
                             )
-                            for s in sub_list
-                        ]
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-        for c_idx in disk_data.get("done_chunks") or []:
-            if isinstance(c_idx, int) and 0 <= c_idx < len(job.chunks):
-                job.done_chunks.add(c_idx)
-                job.subs.setdefault(c_idx, [])
-                cached_segs.setdefault(c_idx, [])
+        # Map all saved Vietnamese subtitles to the current chunk grid by timestamp midpoint
+        raw_subs = disk_data.get("subs") or {}
+        for _, sub_list in raw_subs.items():
+            for s in sub_list:
+                try:
+                    start = float(s["start"])
+                    end = float(s["end"])
+                    vi = str(s.get("vi", "")).strip()
+                    zh = str(s.get("zh", vi)).strip()
+                    gender = str(s.get("gender", "unknown"))
+                    if not vi:
+                        continue
+                    mid = (start + end) / 2.0
+                    target = next((c.index for c in job.chunks if c.start <= mid < c.end), None)
+                    if target is not None:
+                        sub_arr = job.subs.setdefault(target, [])
+                        if not any(abs(float(x.get("start", -99)) - start) < 0.08 for x in sub_arr):
+                            sub_arr.append(
+                                {"start": round(start, 2), "end": round(end, 2), "zh": zh, "vi": vi, "gender": gender}
+                            )
+                        seg_arr = cached_segs.setdefault(target, [])
+                        if not any(abs(x.start - start) < 0.08 for x in seg_arr):
+                            seg_arr.append(Seg(start=start, end=end, zh=zh, vi=vi, gender=gender))
+                        job.done_chunks.add(target)
+                except Exception:
+                    pass
 
-    # Also merge any browser localStorage cached subtitles sent by the client
-    if job.client_cached_done_chunks:
-        for c_idx in job.client_cached_done_chunks:
-            if isinstance(c_idx, int) and 0 <= c_idx < len(job.chunks):
-                job.done_chunks.add(c_idx)
-                job.subs.setdefault(c_idx, [])
-                cached_segs.setdefault(c_idx, [])
+        if same_grid:
+            for c_idx in disk_data.get("done_chunks") or []:
+                if isinstance(c_idx, int) and 0 <= c_idx < len(job.chunks):
+                    job.done_chunks.add(c_idx)
+                    job.subs.setdefault(c_idx, [])
+                    cached_segs.setdefault(c_idx, [])
+        elif disk_data.get("done_ranges"):
+            for r in disk_data["done_ranges"]:
+                r0, r1 = float(r.get("start", 0)), float(r.get("end", 0))
+                for c in job.chunks:
+                    if c.start >= r0 - 0.5 and c.end <= r1 + 0.5:
+                        job.done_chunks.add(c.index)
+                        job.subs.setdefault(c.index, [])
+                        cached_segs.setdefault(c.index, [])
 
+    # Merge any browser localStorage cached subtitles sent by the client
     if job.client_cached_subs:
         for s in job.client_cached_subs:
             try:
@@ -453,7 +500,9 @@ def _restore_cache_into_job(job: Job) -> tuple[dict[int, list[Seg]], dict]:
                 if target is not None:
                     existing = job.subs.setdefault(target, [])
                     if not any(abs(float(x.get("start", -99)) - start) < 0.08 for x in existing):
-                        existing.append({"start": round(start, 2), "end": round(end, 2), "zh": zh, "vi": vi, "gender": gender})
+                        existing.append(
+                            {"start": round(start, 2), "end": round(end, 2), "zh": zh, "vi": vi, "gender": gender}
+                        )
                     seg_list = cached_segs.setdefault(target, [])
                     if not any(abs(g.start - start) < 0.08 for g in seg_list):
                         seg_list.append(Seg(start=start, end=end, zh=zh, vi=vi, gender=gender))
@@ -588,7 +637,6 @@ def run_job(job: Job) -> None:
                     job.pointer = c.index
                     break
 
-        # Restore any previously saved subtitles & ASR segments for this video code (e.g. MEYD-916)
         cached_segs, saved_bible = _restore_cache_into_job(job)
 
         if len(job.done_chunks) >= len(job.chunks) and len(job.chunks) > 0:
@@ -632,42 +680,57 @@ def run_job(job: Job) -> None:
         job.session = session
         job.state = "running"
 
-        # Seed translator history with any cached subtitles right before job.pointer so pronouns stay consistent
         for prev_i in sorted(job.subs):
             if prev_i < job.pointer:
                 for sub_item in job.subs[prev_i]:
                     spk = "Nam" if sub_item.get("gender") == "male" else "Nữ"
                     tr.history.append((sub_item.get("zh", ""), sub_item.get("vi", ""), spk))
 
-        first_todo = job.next_chunk()
-        if first_todo is not None:
-            with gpu_lock:
-                if job.cancel.is_set():
-                    job.state = "cancelled"
-                    return
-                session.warm_up(start_index=first_todo)
-
         while not job.cancel.is_set():
-            i = job.next_chunk()
-            if i is None or job.cancel.is_set():
+            batch = job.next_batch()
+            if not batch or job.cancel.is_set():
                 break
-            c = job.chunks[i]
+
+            b_start = job.chunks[batch[0]].start
+            b_end = job.chunks[batch[-1]].end
+            b_dur = max(0.1, b_end - b_start)
+
+            if len(batch) == 1:
+                print(
+                    f"\n[FAST-START {b_dur:.0f}s] Processing immediate playhead chunk {batch[0]}/{len(job.chunks)} "
+                    f"({b_start:.1f}s -> {b_end:.1f}s)...",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"\n[MEGA-BATCH {b_dur:.0f}s] Processing {len(batch)} chunks ({batch[0]}..{batch[-1]}/{len(job.chunks)}, "
+                    f"{b_start:.1f}s -> {b_end:.1f}s) in 1 contiguous pass...",
+                    flush=True,
+                )
+
             with gpu_lock:
                 if job.cancel.is_set():
                     break
-                subs, timing = session.process(i, cancel_event=job.cancel)
+                subs_by_chunk, timing = session.process_batch(batch, cancel_event=job.cancel)
+
             if job.cancel.is_set():
                 break
+
+            total_new_subs = 0
             with job.lock:
-                job.done_chunks.add(i)
-                job.subs[i] = subs
-                job.timing[i] = timing
+                for idx in batch:
+                    job.done_chunks.add(idx)
+                    c_subs = subs_by_chunk.get(idx, [])
+                    job.subs[idx] = c_subs
+                    job.timing[idx] = timing
+                    total_new_subs += len(c_subs)
+
             _save_video_cache(job)
-            dur = max(0.1, c.end - c.start)
+            mode_tag = "FAST-START" if len(batch) == 1 else "MEGA-BATCH"
             print(
-                f"[job {job.id}] DONE chunk {i}/{len(job.chunks)} ({c.start:.1f}s-{c.end:.1f}s) -> "
-                f"{len(subs)} Vietnamese sub(s) ready (saved to cache '{job.video_code or 'session'}') | "
-                f"timing={timing} RTF={timing.get('total', 0.0) / dur:.2f}\n"
+                f"[job {job.id}] DONE {mode_tag} ({b_start:.1f}s-{b_end:.1f}s, {b_dur:.0f}s audio) -> "
+                f"{total_new_subs} Vietnamese sub(s) ready ({len(job.done_chunks)}/{len(job.chunks)} chunks complete, "
+                f"saved to cache '{job.video_code or 'session'}') | timing={timing} RTF={timing.get('total', 0.0) / b_dur:.2f}\n"
                 f"------------------------------------------------------------",
                 flush=True,
             )
@@ -814,6 +877,7 @@ def main() -> None:
     )
     print("============================================================", flush=True)
     print(f"[Config] Source Language   : {S.source_language} (Whisper model: {S.whisper_model})", flush=True)
+    print(f"[Config] Chunking Mode     : {S.chunk_target_sec:.0f}s First Chunk -> {S.mega_batch_sec:.0f}s Mega-Batches (up to {S.max_lines_per_batch} lines/call)", flush=True)
     print(f"[Config] Translation API   : {S.base_url}", flush=True)
     print(f"[Config] Translation Model : {S.model}", flush=True)
     print(f"[Config] OpenRouter Key    : {masked_key}", flush=True)

@@ -331,7 +331,31 @@
     } catch (_) {}
   }
 
-  // ---------- geometry helpers ----------
+  // ---------- geometry & accurate time/duration helpers ----------
+  function parseTimeText(txt) {
+    if (!txt) return 0;
+    const clean = String(txt).replace(/[^0-9:]/g, "").trim();
+    if (!clean) return 0;
+    const parts = clean.split(":").map((n) => parseInt(n, 10));
+    if (parts.some((n) => isNaN(n))) return 0;
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (parts.length === 2) return parts[0] * 60 + parts[1];
+    return 0;
+  }
+
+  function getVideoDuration(v) {
+    if (v && isFinite(v.duration) && v.duration > 1) return v.duration;
+    const plyrDur = document.querySelector(".plyr__time--duration")?.textContent;
+    const parsed = parseTimeText(plyrDur);
+    return parsed > 0 ? parsed : 0;
+  }
+
+  function getVideoCurrentTime(v) {
+    if (v && isFinite(v.currentTime) && v.currentTime > 0) return v.currentTime;
+    const plyrCur = document.querySelector(".plyr__time--current")?.textContent;
+    return parseTimeText(plyrCur);
+  }
+
   function contentBox(v) {
     const r = v.getBoundingClientRect();
     let l = r.left, t = r.top, w = r.width, h = r.height;
@@ -647,7 +671,7 @@
 
   function renderSub() {
     if (!siteEnabled || !act || !act.info || !Array.isArray(act.info.subs)) { bar.style.display = "none"; return; }
-    const t = act.video.currentTime;
+    const t = getVideoCurrentTime(act.video);
     const sub = act.info.subs.find((s) => t >= s.start - 0.1 && t <= s.end + 0.45);
     if (sub) {
       if (bar.textContent !== sub.vi) bar.textContent = sub.vi;
@@ -853,7 +877,7 @@
       s.info = {
         state: "running",
         error: "",
-        duration: localCache.duration || (isFinite(v.duration) ? v.duration : 0),
+        duration: localCache.duration || getVideoDuration(v),
         chunks: localCache.chunks || [],
         subs: localCache.subs,
       };
@@ -875,7 +899,7 @@
     }
 
     s.onSeeking = () => {
-      maybeSeek(s, v.currentTime);
+      maybeSeek(s, getVideoCurrentTime(v));
     };
     v.addEventListener("seeking", s.onSeeking);
     act = s;
@@ -930,7 +954,8 @@
     if (act !== s) { s.creating = false; return; }
 
     try {
-      const startSec = v.currentTime > 1.5 ? v.currentTime : 0;
+      const curSec = getVideoCurrentTime(v);
+      const startSec = curSec > 1.5 ? curSec : 0;
       s.lastSeekSent = startSec;
       const res = await fetch(`${SERVER}/jobs`, {
         method: "POST",
@@ -938,7 +963,7 @@
         body: JSON.stringify({
           urls,
           exact,
-          duration: isFinite(v.duration) ? v.duration : 0,
+          duration: getVideoDuration(v),
           referer: location.href,
           cookie: document.cookie || "",
           user_agent: navigator.userAgent,
@@ -1038,7 +1063,7 @@
     if (!info) return;
     if (info.state === "error") { stop(s, "Lỗi server: " + info.error); return; }
 
-    const t = v.currentTime;
+    const t = getVideoCurrentTime(v);
     const c = chunkAt(s, t);
     if (!c) return;
 
