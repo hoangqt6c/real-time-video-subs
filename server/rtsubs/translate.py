@@ -1,6 +1,9 @@
 """JA->VI subtitle translation tuned for natural, sensual, uncensored 18+ dialogue,
-with Male/Female speaker voice tags, page synopsis/summary context, and high-capacity
-Mega-Batch translation (up to 50 lines / 150s per OpenRouter call with missing-ID recovery).
+with:
+- Free-First OpenRouter Model Router (:free tier priority + automatic fallback rotation on 429/402/5xx)
+- Compact 600-token Story Bible
+- Dynamic right-sized `max_tokens` per batch (~55 tokens/line + 120 buffer)
+- Automatic token & chunk-length adaptation when OpenRouter reports 'can only afford X tokens' (HTTP 402)
 """
 from __future__ import annotations
 
@@ -19,7 +22,7 @@ SYSTEM = """Bạn là dịch giả phụ đề phim người lớn (18+ / NSFW /
 2. TRANSCRIPT: lời thoại gốc của video để nắm bắt bối cảnh, diễn biến cảm xúc và cao trào. KHÔNG dịch phần này.
 3. Yêu cầu dịch, là JSON gồm:
    - previous_lines: vài câu liền trước (gốc + vi + speaker) để nối mạch cảm xúc và xưng hô. KHÔNG dịch lại.
-   - translate: danh sách các câu cần dịch theo thứ tự thoại (có thể lên tới 50 câu trong một cảnh 2–3 phút), mỗi câu là {id, speaker, zh, max_chars} trong đó:
+   - translate: danh sách các câu cần dịch theo thứ tự thoại, mỗi câu là {id, speaker, zh, max_chars} trong đó:
      * `speaker`: "Nam" (giọng đàn ông) hoặc "Nữ" (giọng phụ nữ) được phân tích trực tiếp từ tần số âm thanh giọng nói.
      * `zh`: câu tiếng Nhật từ Whisper ASR.
 
@@ -48,22 +51,20 @@ SYSTEM = """Bạn là dịch giả phụ đề phim người lớn (18+ / NSFW /
 translate: [{"id":0,"speaker":"Nữ","zh":"あっ…だめ、そこ気持ちいい…もっと触って…","max_chars":80},{"id":1,"speaker":"Nam","zh":"ほら、もうこんなに濡れてるじゃないか…","max_chars":80}]
 trả về: {"items":[{"id":0,"vi":"A… đừng mà anh, chỗ đó sướng quá… chạm vào em thêm nữa đi…"},{"id":1,"vi":"Nhìn xem, chẳng phải chỗ này của em đã ướt đẫm hết rồi sao…"}]}"""
 
-UNDERSTAND_SYSTEM = """Bạn là biên tập viên kịch bản phim 18+ / JAV chuyên nghiệp. Bạn nhận THÔNG TIN & TÓM TẮT PHIM TỪ TRANG WEB cùng với TRANSCRIPT (có mốc thời gian và nhãn giọng Nam/Nữ) từ nhận dạng giọng nói tiếng Nhật, và lập STORY BIBLE để người dịch phụ đề tiếng Việt dịch thật gợi cảm, chuẩn xác, nhất quán về xưng hô và cảm xúc.
+UNDERSTAND_SYSTEM = """Bạn là biên tập viên kịch bản phim 18+ / JAV chuyên nghiệp. Bạn nhận THÔNG TIN & TÓM TẮT PHIM TỪ TRANG WEB cùng với TRANSCRIPT (có mốc thời gian và nhãn giọng Nam/Nữ) từ nhận dạng giọng nói tiếng Nhật, và lập STORY BIBLE thật ngắn gọn (dưới 500 tokens) để người dịch phụ đề tiếng Việt dịch gợi cảm, chuẩn xác, nhất quán về xưng hô.
 
-Trả về DUY NHẤT một JSON object, không Markdown, với các khóa:
-- synopsis: tóm tắt bối cảnh, mối quan hệ nhân vật (ví dụ: NTR hàng xóm, trao đổi cặp đôi, vợ chồng, chị em, sếp - nhân viên...) và diễn biến cảnh ân ái bằng tiếng Việt, tối đa 100 từ.
-- genre_tone: thể loại và sắc thái cảm xúc (ví dụ: "NTR lén lút, kích thích, nồng nhiệt", "Lãng mạn, ngọt ngào", "Roleplay công sở, táo bạo"), tối đa 30 từ.
-- characters: tối đa 10 nhân vật. Mỗi mục {"zh": tên hoặc cách gọi trong tiếng Nhật, "vi": tên/vai tiếng Việt, "gender": "nam"|"nữ", "role": mối quan hệ/vai vế, "calls": cách xưng hô tình tứ chuẩn trong tiếng Việt như "anh - em", "chị - em", "thầy - em"}.
-- terminology: object {"từ/cụm từ gốc": "cách dịch tiếng Việt gợi cảm/tự nhiên"}, tối đa 30 mục.
-- asr_fixes: object {"từ ASR nghe nhầm": "câu/từ đúng trong ngữ cảnh 18+"}, tối đa 30 mục.
-
-Quy tắc:
-- Kết hợp thông tin từ TÓM TẮT TRANG WEB (tên nhân vật như Yuito, Nono, bối cảnh phòng thông nhau, NTR...) với lời thoại trong TRANSCRIPT.
-- Luôn chọn cách xưng hô thân mật, gợi tình phù hợp với vai vế Nam/Nữ của từng nhân vật."""
+Trả về DUY NHẤT một JSON object gọn nhẹ, không Markdown, với các khóa:
+- synopsis: tóm tắt bối cảnh, mối quan hệ nhân vật và diễn biến cảnh ân ái bằng tiếng Việt, tối đa 60 từ.
+- genre_tone: thể loại và sắc thái cảm xúc (ví dụ: "NTR lén lút, kích thích, nồng nhiệt"), tối đa 20 từ.
+- characters: tối đa 6 nhân vật. Mỗi mục {"zh": tên/cách gọi gốc, "vi": tên/vai tiếng Việt, "gender": "nam"|"nữ", "calls": cách xưng hô như "anh - em", "chị - em"}.
+- terminology: object {"từ gốc": "cách dịch gợi cảm"}, tối đa 10 mục.
+- asr_fixes: object {"từ nghe nhầm": "từ đúng"}, tối đa 8 mục."""
 
 BIBLE_KEYS = ("synopsis", "genre_tone", "characters", "terminology", "asr_fixes")
-BIBLE_CAPS = {"characters": 10, "terminology": 30, "asr_fixes": 30}
+BIBLE_CAPS = {"characters": 6, "terminology": 10, "asr_fixes": 8}
 EMPTY_BIBLE_TEXT = "[STORY BIBLE]\n(chưa có — ưu tiên xưng hô theo đúng giới tính giọng nói Nam='anh', Nữ='em' tình tứ, gợi cảm)\n[HẾT STORY BIBLE]"
+
+_AFFORD_RE = re.compile(r"can only afford\s+(\d+)", re.IGNORECASE)
 
 
 def _canon(obj) -> str:
@@ -145,9 +146,11 @@ class Translator:
         from openai import OpenAI
 
         self.s = s
-        self.client = OpenAI(base_url=s.base_url, api_key=s.api_key, timeout=90)
+        self.client = OpenAI(base_url=s.base_url, api_key=s.api_key, timeout=75)
         self.history: list[tuple[str, str, str]] = []  # (source, vi, speaker_label)
         self._lock = threading.Lock()
+        self.model_chain: list[str] = list(s.model_chain) if s.model_chain else [s.model]
+        self.model_idx: int = 0
         self.video_code = (video_code or "").strip()
         self.page_title = (page_title or "").strip()
         self.page_summary = (page_summary or "").strip()
@@ -160,6 +163,45 @@ class Translator:
         else:
             self._bible_text = EMPTY_BIBLE_TEXT
         self._transcript_text = ""
+
+    @property
+    def active_model(self) -> str:
+        return self.model_chain[self.model_idx % len(self.model_chain)]
+
+    def _rotate_model(self, reason: str) -> str:
+        old_model = self.active_model
+        if len(self.model_chain) > 1:
+            self.model_idx = (self.model_idx + 1) % len(self.model_chain)
+            self.s.model = self.active_model
+            print(
+                f"[OpenRouter Router] Switching model '{old_model}' -> '{self.active_model}' ({reason})",
+                flush=True,
+            )
+        return self.active_model
+
+    def _handle_api_exception(self, exc: Exception, step_label: str) -> None:
+        msg = str(exc)
+        # 1. Check if OpenRouter returned 402 with "can only afford X"
+        m = _AFFORD_RE.search(msg)
+        if m:
+            affordable = int(m.group(1))
+            self.s.adapt_to_token_limit(affordable)
+            # If the current model is not a :free model, switch to a :free model immediately!
+            if not self.active_model.endswith(":free") and any(x.endswith(":free") for x in self.model_chain):
+                for idx, candidate in enumerate(self.model_chain):
+                    if candidate.endswith(":free"):
+                        self.model_idx = idx
+                        self.s.model = candidate
+                        print(
+                            f"[OpenRouter Router] Credit limit hit on paid model -> switched to FREE model '{candidate}'",
+                            flush=True,
+                        )
+                        break
+            return
+
+        # 2. Rotate model on 429 (rate limit), 402 (credits), 404 (retired model), or 502/503 (provider down)
+        if any(code in msg for code in ("429", "402", "404", "502", "503", "rate", "No endpoints", "Provider returned error")):
+            self._rotate_model(f"{step_label}: {msg[:100]}")
 
     def _build_page_context_block(self) -> str:
         lines = []
@@ -174,7 +216,7 @@ class Translator:
         return "[THÔNG TIN & TÓM TẮT CỐT TRUYỆN TỪ TRANG WEB]\n" + "\n".join(lines) + "\n[HẾT TÓM TẮT TRANG WEB]"
 
     def understand(self, lines: list[tuple[float, str, str]], complete: bool) -> None:
-        """Build the story bible from the page summary + SOURCE transcript."""
+        """Build the story bible from the page summary + SOURCE transcript using compact max_tokens=600."""
         if not lines and not self.page_context_block:
             return
         if self.s.api_key == "dummy":
@@ -191,14 +233,20 @@ class Translator:
             {"role": "user", "content": user_content},
         ]
         bible = None
-        for _ in range(2):
+        for _ in range(3):
+            bible_tokens = min(self.s.bible_max_tokens, self.s.token_ceiling)
             try:
-                r = self.client.chat.completions.create(model=self.s.model, messages=messages, max_tokens=4000)
-                self._log_usage(r, "bible")
+                r = self.client.chat.completions.create(
+                    model=self.active_model,
+                    messages=messages,
+                    max_tokens=bible_tokens,
+                )
+                self._log_usage(r, f"bible ({self.active_model})")
                 bible = _normalize_bible(_json_object(r.choices[0].message.content))
                 break
             except Exception as exc:
-                print(f"[bible] retry: {exc}", flush=True)
+                print(f"[bible] warning ({self.active_model}, max_tokens={bible_tokens}): {exc}", flush=True)
+                self._handle_api_exception(exc, "bible")
         with self._lock:
             if transcript:
                 self._transcript_text = transcript
@@ -207,15 +255,13 @@ class Translator:
                 self._bible_text = _bible_message(bible, self.page_context_block)
         if bible is not None:
             print(
-                f"[bible] Built Story Bible from page summary + {len(lines)} lines (complete={complete}): "
+                f"[bible] Built Story Bible (max_tokens={self.s.bible_max_tokens}) from page summary + {len(lines)} lines: "
                 f"{len(bible['characters'])} characters, {len(bible['terminology'])} terms",
                 flush=True,
             )
 
     def translate(self, segs: list[Seg], slots: list[float]) -> None:
-        """Translate a list of segments (from a 15s initial chunk or a 150s Mega-Batch).
-        Automatically processes up to `s.max_lines_per_batch` (default 50) lines per single OpenRouter call
-        with `max_tokens=8192` and retries only missing IDs if a large batch partially completes."""
+        """Translate a list of segments using dynamic right-sized `max_tokens` and adaptive sub-batching."""
         if not segs:
             return
         if all(bool(g.vi) for g in segs):
@@ -233,27 +279,18 @@ class Translator:
                 g.vi = g.zh
             return
 
-        cap = max(10, self.s.max_lines_per_batch)
-        if len(segs) > cap:
-            print(
-                f"[Step 3/3 - OpenRouter VI] Mega-Batch has {len(segs)} lines (>{cap} max per call); "
-                f"splitting into {(len(segs) + cap - 1) // cap} sub-batches...",
-                flush=True,
-            )
-            for offset in range(0, len(segs), cap):
-                self._translate_subbatch(segs[offset : offset + cap], slots[offset : offset + cap])
-        else:
-            self._translate_subbatch(segs, slots)
+        idx = 0
+        while idx < len(segs):
+            cap = max(4, self.s.max_lines_per_batch)
+            sub_segs = segs[idx : idx + cap]
+            sub_slots = slots[idx : idx + cap]
+            self._translate_subbatch(sub_segs, sub_slots)
+            idx += len(sub_segs)
 
     def _translate_subbatch(self, segs: list[Seg], slots: list[float]) -> None:
         t0 = time.time()
         male_cnt = sum(1 for g in segs if g.gender == "male")
         female_cnt = len(segs) - male_cnt
-        print(
-            f"[Step 3/3 - OpenRouter VI] Uploading {len(segs)} Japanese line(s) "
-            f"(Nữ={female_cnt}, Nam={male_cnt}) to {self.s.base_url} (model={self.s.model}, max_tokens=8192)...",
-            flush=True,
-        )
 
         with self._lock:
             bible_text, transcript_text = self._bible_text, self._transcript_text
@@ -261,7 +298,22 @@ class Translator:
         result: dict[int, str] = {}
         missing_ids = list(range(len(segs)))
 
-        for attempt in range(1, 4):
+        for attempt in range(1, 5):
+            # Dynamically calculate max_tokens needed for the exact number of lines (~55 tokens per line + 120 buffer)
+            needed_tokens = max(250, len(missing_ids) * 55 + 120)
+            req_max_tokens = min(self.s.token_ceiling, needed_tokens)
+
+            # If token_ceiling was shrunk below what missing_ids needs, slice missing_ids to fit!
+            max_fit_lines = max(3, (req_max_tokens - 100) // 55)
+            active_ids = missing_ids[:max_fit_lines]
+            req_max_tokens = min(self.s.token_ceiling, max(250, len(active_ids) * 55 + 120))
+
+            print(
+                f"[Step 3/3 - OpenRouter VI] Uploading {len(active_ids)}/{len(segs)} Japanese line(s) "
+                f"(Nữ={female_cnt}, Nam={male_cnt}) -> model='{self.active_model}' (dynamic max_tokens={req_max_tokens})...",
+                flush=True,
+            )
+
             ctx = self.history[-self.s.context_pairs :]
             req = {
                 "previous_lines": [{"speaker": spk, "zh": z, "vi": v} for z, v, spk in ctx],
@@ -272,7 +324,7 @@ class Translator:
                         "zh": segs[idx].zh,
                         "max_chars": max(30, int(slots[idx] * self.s.chars_per_sec)),
                     }
-                    for idx in missing_ids
+                    for idx in active_ids
                 ],
             }
             messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": bible_text}]
@@ -281,30 +333,36 @@ class Translator:
             messages.append({"role": "user", "content": json.dumps(req, ensure_ascii=False)})
 
             try:
-                r = self.client.chat.completions.create(model=self.s.model, messages=messages, max_tokens=8192)
-                self._log_usage(r, "OpenRouter")
+                r = self.client.chat.completions.create(
+                    model=self.active_model,
+                    messages=messages,
+                    max_tokens=req_max_tokens,
+                )
+                self._log_usage(r, f"OpenRouter ({self.active_model})")
                 parsed = _parse(r.choices[0].message.content)
                 result.update(parsed)
                 missing_ids = [i for i in range(len(segs)) if i not in result]
                 if not missing_ids:
                     break
                 print(
-                    f"[Step 3/3 - OpenRouter VI] Received {len(result)}/{len(segs)} lines; "
-                    f"fetching remaining {len(missing_ids)} line(s) (attempt {attempt + 1}/3)...",
+                    f"[Step 3/3 - OpenRouter VI] Translated {len(result)}/{len(segs)} lines so far; "
+                    f"continuing with remaining {len(missing_ids)} line(s)...",
                     flush=True,
                 )
-            except Exception as exc:  # network / malformed JSON -> retry
-                print(f"[Step 3/3 - OpenRouter WARNING] Attempt {attempt}/3 failed: {exc}", flush=True)
+            except Exception as exc:
+                print(f"[Step 3/3 - OpenRouter WARNING] Attempt {attempt}/4 on '{self.active_model}' failed: {exc}", flush=True)
+                self._handle_api_exception(exc, "translate")
 
         elapsed = time.time() - t0
         if result:
             print(
-                f"[Step 3/3 - OpenRouter VI] SUCCESS! Translated {len(result)}/{len(segs)} line(s) in {elapsed:.2f}s:",
+                f"[Step 3/3 - OpenRouter VI] SUCCESS! Translated {len(result)}/{len(segs)} line(s) in {elapsed:.2f}s "
+                f"(model={self.active_model}):",
                 flush=True,
             )
         else:
             print(
-                f"[Step 3/3 - OpenRouter ERROR] Translation failed after 3 attempts ({elapsed:.2f}s) - falling back to original text.",
+                f"[Step 3/3 - OpenRouter ERROR] Translation failed after retries ({elapsed:.2f}s) - falling back to original text.",
                 flush=True,
             )
         for i, g in enumerate(segs):
